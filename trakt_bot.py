@@ -83,7 +83,7 @@ def require_config() -> None:
 
 
 def load_pushed_ids() -> List[str]:
-    """读取已推送剧集 ID；文件不存在时初始化为空列表。"""
+    """读取已推送条目 ID；文件不存在时初始化为空列表。"""
     if not STATE_FILE.exists():
         logging.info("未找到 pushed_episodes.json，将使用空状态启动。")
         return []
@@ -98,8 +98,16 @@ def load_pushed_ids() -> List[str]:
     if not isinstance(raw, list):
         raise RuntimeError("pushed_episodes.json 顶层结构必须是数组")
 
-    # 统一转为字符串，避免 Trakt ID 在不同地方以 int/string 表示导致去重失效。
-    ids = [str(item) for item in raw if item is not None]
+    ids = []
+    for item in raw:
+        if item is None:
+            continue
+        text = str(item)
+        # 兼容旧版本保存的纯 episode id，迁移成带类型前缀的去重键。
+        if ":" not in text:
+            text = f"episode:{text}"
+        ids.append(text)
+
     return dedupe_keep_order(ids)[-MAX_STATE_RECORDS:]
 
 
@@ -247,51 +255,74 @@ def trakt_headers(access_token: str) -> Dict[str, str]:
     }
 
 
-def request_today_calendar(tokens: TraktTokens) -> requests.Response:
+def request_calendar(tokens: TraktTokens, media_type: str) -> requests.Response:
     start_date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    url = f"https://api.trakt.tv/calendars/my/shows/{start_date}/{TRAKT_CALENDAR_DAYS}"
+    url = f"https://api.trakt.tv/calendars/my/{media_type}/{start_date}/{TRAKT_CALENDAR_DAYS}"
 
     try:
         return requests.get(url, headers=trakt_headers(tokens.access_token), timeout=REQUEST_TIMEOUT)
     except requests.RequestException as exc:
-        raise RuntimeError(f"请求 Trakt API 失败：{exc}") from exc
+        raise RuntimeError(f"请求 Trakt {media_type} 日历失败：{exc}") from exc
 
 
-def fetch_today_calendar(tokens: TraktTokens) -> List[Dict[str, Any]]:
-    """调用 Trakt 个人日历接口，401 时自动刷新 token 并重试一次。"""
-    if TRAKT_FORCE_REFRESH or not tokens.access_token:
-        logging.info("开始刷新 Trakt token。")
-        refresh_trakt_token(tokens)
-
-    response = request_today_calendar(tokens)
-    if response.status_code == 401 and can_refresh_trakt_token(tokens):
-        logging.warning("Trakt access_token 已失效，开始自动续期。")
-        refresh_trakt_token(tokens)
-        response = request_today_calendar(tokens)
-
+def parse_calendar_response(response: requests.Response, media_type: str) -> List[Dict[str, Any]]:
     if response.status_code >= 400:
         raise RuntimeError(
-            f"Trakt API 返回错误：HTTP {response.status_code} - {response.text[:500]}"
+            f"Trakt {media_type} 日历返回错误：HTTP {response.status_code} - {response.text[:500]}"
         )
 
     try:
         data = response.json()
     except ValueError as exc:
-        raise RuntimeError(f"Trakt API 响应不是合法 JSON：{exc}") from exc
+        raise RuntimeError(f"Trakt {media_type} 日历响应不是合法 JSON：{exc}") from exc
 
     if not isinstance(data, list):
-        raise RuntimeError("Trakt API 响应格式异常：顶层结构不是数组")
+        raise RuntimeError(f"Trakt {media_type} 日历响应格式异常：顶层结构不是数组")
 
     return data
 
 
+def fetch_calendar(tokens: TraktTokens, media_type: str) -> List[Dict[str, Any]]:
+    """调用 Trakt 个人日历接口，401 时自动刷新 token 并重试一次。"""
+    response = request_calendar(tokens, media_type)
+    if response.status_code == 401 and can_refresh_trakt_token(tokens):
+        logging.warning("Trakt access_token 已失效，开始自动续期。")
+        refresh_trakt_token(tokens)
+        response = request_calendar(tokens, media_type)
+
+    return parse_calendar_response(response, media_type)
+
+
+def fetch_today_items(tokens: TraktTokens) -> List[Dict[str, str]]:
+    """获取今天的剧集和电影，并解析成统一的推送条目。"""
+    if TRAKT_FORCE_REFRESH or not tokens.access_token:
+        logging.info("开始刷新 Trakt token。")
+        refresh_trakt_token(tokens)
+
+    items = []
+    show_entries = fetch_calendar(tokens, "shows")
+    movie_entries = fetch_calendar(tokens, "movies")
+
+    for entry in show_entries:
+        item = extract_episode(entry)
+        if item:
+            items.append(item)
+
+    for entry in movie_entries:
+        item = extract_movie(entry)
+        if item:
+            items.append(item)
+
+    return items
+
+
 def extract_episode(item: Dict[str, Any]) -> Optional[Dict[str, str]]:
-    """从 Trakt 日历条目中提取推送所需字段。"""
+    """从 Trakt 日历条目中提取剧集字段。"""
     episode = item.get("episode") or {}
     show = item.get("show") or {}
 
     if not isinstance(episode, dict) or not isinstance(show, dict):
-        logging.warning("跳过格式异常的日历条目：%s", item)
+        logging.warning("跳过格式异常的剧集日历条目：%s", item)
         return None
 
     episode_ids = episode.get("ids") or {}
@@ -304,12 +335,43 @@ def extract_episode(item: Dict[str, Any]) -> Optional[Dict[str, str]]:
     number = episode.get("number")
 
     return {
-        "id": str(trakt_id),
-        "show_title": safe_text(show.get("title"), "未知剧集"),
-        "season": str(season) if season is not None else "?",
-        "number": str(number) if number is not None else "?",
-        "episode_title": safe_text(episode.get("title"), "未命名单集"),
-        "first_aired": format_air_time(item.get("first_aired") or episode.get("first_aired")),
+        "key": f"episode:{trakt_id}",
+        "type": "episode",
+        "label": "剧集",
+        "title": safe_text(show.get("title"), "未知剧集"),
+        "subtitle": safe_text(episode.get("title"), "未命名单集"),
+        "code": f"S{season if season is not None else '?'}E{number if number is not None else '?'}",
+        "aired": format_air_time(item.get("first_aired") or episode.get("first_aired")),
+    }
+
+
+def extract_movie(item: Dict[str, Any]) -> Optional[Dict[str, str]]:
+    """从 Trakt 日历条目中提取电影字段。"""
+    movie = item.get("movie") or {}
+
+    if not isinstance(movie, dict):
+        logging.warning("跳过格式异常的电影日历条目：%s", item)
+        return None
+
+    movie_ids = movie.get("ids") or {}
+    trakt_id = movie_ids.get("trakt")
+    if trakt_id is None:
+        logging.warning("跳过缺少 Trakt Movie ID 的条目：%s", item)
+        return None
+
+    year = movie.get("year")
+    title = safe_text(movie.get("title"), "未知电影")
+    if year:
+        title = f"{title} ({year})"
+
+    return {
+        "key": f"movie:{trakt_id}",
+        "type": "movie",
+        "label": "电影",
+        "title": title,
+        "subtitle": "",
+        "code": "Movie",
+        "aired": format_air_time(item.get("first_aired") or movie.get("released")),
     }
 
 
@@ -337,15 +399,15 @@ def format_air_time(value: Any) -> str:
     return dt.strftime("%Y-%m-%d %H:%M")
 
 
-def build_discord_message(episodes: Sequence[Dict[str, str]]) -> str:
-    lines = ["**今日流媒体剧集更新**", ""]
-    for ep in episodes:
-        code = f"S{ep['season']}E{ep['number']}"
+def build_discord_message(items: Sequence[Dict[str, str]]) -> str:
+    lines = ["**今日流媒体更新**", ""]
+    for item in items:
+        lines.append(f"**[{item['label']}] {item['title']}**")
+        if item["type"] == "episode":
+            lines.append(f"- `{item['code']}` {item['subtitle']}")
         lines.extend(
             [
-                f"**{ep['show_title']}**",
-                f"- `{code}` {ep['episode_title']}",
-                f"- 上线时间：{ep['first_aired']}",
+                f"- 上线时间：{item['aired']}",
                 "",
             ]
         )
@@ -366,19 +428,21 @@ def escape_markdown_v2(text: str) -> str:
     return "".join(escaped)
 
 
-def build_telegram_message(episodes: Sequence[Dict[str, str]]) -> str:
-    lines = ["*今日流媒体剧集更新*", ""]
-    for ep in episodes:
-        code = escape_markdown_v2(f"S{ep['season']}E{ep['number']}")
-        show_title = escape_markdown_v2(ep["show_title"])
-        episode_title = escape_markdown_v2(ep["episode_title"])
-        first_aired = escape_markdown_v2(ep["first_aired"])
+def build_telegram_message(items: Sequence[Dict[str, str]]) -> str:
+    lines = ["*今日流媒体更新*", ""]
+    for item in items:
+        label = escape_markdown_v2(item["label"])
+        title = escape_markdown_v2(item["title"])
+        aired = escape_markdown_v2(item["aired"])
 
+        lines.append(f"*\\[{label}\\] {title}*")
+        if item["type"] == "episode":
+            code = escape_markdown_v2(item["code"])
+            subtitle = escape_markdown_v2(item["subtitle"])
+            lines.append(f"• `{code}` {subtitle}")
         lines.extend(
             [
-                f"*{show_title}*",
-                f"• `{code}` {episode_title}",
-                f"• 上线时间：{first_aired}",
+                f"• 上线时间：{aired}",
                 "",
             ]
         )
@@ -416,12 +480,12 @@ def split_message(text: str, limit: int) -> List[str]:
     return chunks
 
 
-def send_telegram(episodes: Sequence[Dict[str, str]]) -> bool:
+def send_telegram(items: Sequence[Dict[str, str]]) -> bool:
     if not (TG_BOT_TOKEN and TG_CHAT_ID):
         return True
 
     url = f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage"
-    message = build_telegram_message(episodes)
+    message = build_telegram_message(items)
     chunks = split_message(message, 3900)
 
     for index, chunk in enumerate(chunks, start=1):
@@ -451,11 +515,11 @@ def send_telegram(episodes: Sequence[Dict[str, str]]) -> bool:
     return True
 
 
-def send_discord(episodes: Sequence[Dict[str, str]]) -> bool:
+def send_discord(items: Sequence[Dict[str, str]]) -> bool:
     if not DISCORD_WEBHOOK_URL:
         return True
 
-    message = build_discord_message(episodes)
+    message = build_discord_message(items)
     chunks = split_message(message, 1900)
 
     for index, chunk in enumerate(chunks, start=1):
@@ -495,33 +559,29 @@ def main() -> int:
         pushed_ids = load_pushed_ids()
         pushed_set = set(pushed_ids)
 
-        calendar_items = fetch_today_calendar(tokens)
+        calendar_items = fetch_today_items(tokens)
 
-        new_episodes = []
+        new_items = []
         new_ids = []
         seen_this_run = set()
 
         for item in calendar_items:
-            episode = extract_episode(item)
-            if not episode:
+            item_key = item["key"]
+            if item_key in pushed_set or item_key in seen_this_run:
                 continue
 
-            episode_id = episode["id"]
-            if episode_id in pushed_set or episode_id in seen_this_run:
-                continue
+            new_items.append(item)
+            new_ids.append(item_key)
+            seen_this_run.add(item_key)
 
-            new_episodes.append(episode)
-            new_ids.append(episode_id)
-            seen_this_run.add(episode_id)
-
-        if not new_episodes:
-            logging.info("没有发现需要推送的新剧集。")
+        if not new_items:
+            logging.info("没有发现需要推送的新剧集或电影。")
             return 0
 
-        logging.info("发现 %s 个新剧集，准备推送。", len(new_episodes))
+        logging.info("发现 %s 个新条目，准备推送。", len(new_items))
 
-        telegram_ok = send_telegram(new_episodes)
-        discord_ok = send_discord(new_episodes)
+        telegram_ok = send_telegram(new_items)
+        discord_ok = send_discord(new_items)
 
         # 只有所有已配置渠道都成功后才写入去重文件，避免通知失败却被标记为已推送。
         if not (telegram_ok and discord_ok):

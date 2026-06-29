@@ -1,6 +1,6 @@
 # Trakt Streaming Update Bot
 
-GitHub Actions 每小时运行一次，读取 Trakt.tv 个人剧集日历，并推送新上架剧集到 Telegram 或 Discord。
+GitHub Actions 每小时运行一次，读取 Trakt.tv 个人剧集和电影日历，并推送新上架内容到 Telegram 或 Discord。
 
 ## GitHub Secrets
 
@@ -34,4 +34,11 @@ GitHub Actions 每小时运行一次，读取 Trakt.tv 个人剧集日历，并�
 
 推送到 GitHub 后，工作流会按 UTC 每小时整点运行，也可以在 Actions 页面手动触发。
 
-去重状态保存在 `pushed_episodes.json`，每次成功推送后由 GitHub Actions 自动提交回仓库。
+脚本会读取：
+
+- `/calendars/my/shows/{YYYY-MM-DD}/1`
+- `/calendars/my/movies/{YYYY-MM-DD}/1`
+
+因此在播剧当天出现新的集数时，只要它出现在你的 Trakt 个人日历里，就会被推送。
+
+去重状态保存在 `pushed_episodes.json`，每次成功推送后由 GitHub Actions 自动提交回仓库。新记录会使用 `episode:ID` 和 `movie:ID` 区分类型。
