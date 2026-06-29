@@ -9,10 +9,26 @@ GitHub Actions 每小时运行一次，读取 Trakt.tv 个人剧集日历，并�
 - `TRAKT_CLIENT_ID`
 - `TRAKT_ACCESS_TOKEN`
 
+建议同时配置，用于 Trakt token 自动续期：
+
+- `TRAKT_CLIENT_SECRET`
+- `TRAKT_REFRESH_TOKEN`
+
 至少配置一个推送渠道：
 
 - Telegram：`TG_BOT_TOKEN` 和 `TG_CHAT_ID`
 - Discord：`DISCORD_WEBHOOK_URL`
+
+## 自动续期
+
+当 Trakt 返回 401 时，脚本会使用 `TRAKT_REFRESH_TOKEN` 自动换取新的 `access_token` 和 `refresh_token`。
+
+刷新成功后，脚本会通过 GitHub CLI 写回仓库 Secrets：
+
+- `TRAKT_ACCESS_TOKEN`
+- `TRAKT_REFRESH_TOKEN`
+
+敏感 token 不会写入仓库文件。
 
 ## 运行方式
 

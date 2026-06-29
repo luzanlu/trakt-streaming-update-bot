@@ -34,10 +34,13 @@ jobs:
       - name: Run Trakt bot
         env:
           TRAKT_CLIENT_ID: ${{ secrets.TRAKT_CLIENT_ID }}
+          TRAKT_CLIENT_SECRET: ${{ secrets.TRAKT_CLIENT_SECRET }}
           TRAKT_ACCESS_TOKEN: ${{ secrets.TRAKT_ACCESS_TOKEN }}
+          TRAKT_REFRESH_TOKEN: ${{ secrets.TRAKT_REFRESH_TOKEN }}
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          GH_TOKEN: ${{ github.token }}
         run: python trakt_bot.py
 
       - name: Commit pushed episode state

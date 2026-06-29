@@ -1,7 +1,10 @@
 import json
 import logging
 import os
+import shutil
+import subprocess
 import sys
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence
@@ -11,6 +14,7 @@ import requests
 
 TRAKT_API_VERSION = "2"
 TRAKT_CALENDAR_DAYS = 1
+TRAKT_REDIRECT_URI = os.getenv("TRAKT_REDIRECT_URI", "urn:ietf:wg:oauth:2.0:oob").strip()
 REQUEST_TIMEOUT = 20
 MAX_STATE_RECORDS = 500
 
@@ -18,10 +22,21 @@ BASE_DIR = Path(__file__).resolve().parent
 STATE_FILE = BASE_DIR / "pushed_episodes.json"
 
 TRAKT_CLIENT_ID = os.getenv("TRAKT_CLIENT_ID", "").strip()
+TRAKT_CLIENT_SECRET = os.getenv("TRAKT_CLIENT_SECRET", "").strip()
 TRAKT_ACCESS_TOKEN = os.getenv("TRAKT_ACCESS_TOKEN", "").strip()
+TRAKT_REFRESH_TOKEN = os.getenv("TRAKT_REFRESH_TOKEN", "").strip()
+TRAKT_FORCE_REFRESH = os.getenv("TRAKT_FORCE_REFRESH", "").strip().lower() in {
+    "1",
+    "true",
+    "yes",
+    "y",
+}
+
 TG_BOT_TOKEN = os.getenv("TG_BOT_TOKEN", "").strip()
 TG_CHAT_ID = os.getenv("TG_CHAT_ID", "").strip()
 DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL", "").strip()
+
+GITHUB_REPOSITORY = os.getenv("GITHUB_REPOSITORY", "").strip()
 
 
 logging.basicConfig(
@@ -34,16 +49,31 @@ class ConfigError(RuntimeError):
     pass
 
 
+@dataclass
+class TraktTokens:
+    access_token: str
+    refresh_token: str
+
+
 def require_config() -> None:
     """校验必要配置，避免运行时静默失败。"""
     missing = []
     if not TRAKT_CLIENT_ID:
         missing.append("TRAKT_CLIENT_ID")
-    if not TRAKT_ACCESS_TOKEN:
-        missing.append("TRAKT_ACCESS_TOKEN")
+
+    has_access_token = bool(TRAKT_ACCESS_TOKEN)
+    has_refresh_credentials = bool(TRAKT_CLIENT_SECRET and TRAKT_REFRESH_TOKEN)
+    if not has_access_token and not has_refresh_credentials:
+        missing.append("TRAKT_ACCESS_TOKEN 或 TRAKT_CLIENT_SECRET + TRAKT_REFRESH_TOKEN")
 
     if missing:
         raise ConfigError(f"缺少必要环境变量：{', '.join(missing)}")
+
+    if TRAKT_FORCE_REFRESH and not has_refresh_credentials:
+        raise ConfigError("TRAKT_FORCE_REFRESH=true 时必须配置 TRAKT_CLIENT_SECRET 和 TRAKT_REFRESH_TOKEN")
+
+    if bool(TRAKT_CLIENT_SECRET) != bool(TRAKT_REFRESH_TOKEN):
+        raise ConfigError("Trakt 自动续期配置不完整：TRAKT_CLIENT_SECRET 和 TRAKT_REFRESH_TOKEN 必须同时提供")
 
     if bool(TG_BOT_TOKEN) != bool(TG_CHAT_ID):
         raise ConfigError("Telegram 配置不完整：TG_BOT_TOKEN 和 TG_CHAT_ID 必须同时提供")
@@ -100,22 +130,144 @@ def dedupe_keep_order(items: Sequence[str]) -> List[str]:
     return result
 
 
-def fetch_today_calendar() -> List[Dict[str, Any]]:
-    """调用 Trakt 个人日历接口，获取今天起 1 天内的剧集。"""
-    start_date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    url = f"https://api.trakt.tv/calendars/my/shows/{start_date}/{TRAKT_CALENDAR_DAYS}"
+def can_refresh_trakt_token(tokens: TraktTokens) -> bool:
+    return bool(TRAKT_CLIENT_ID and TRAKT_CLIENT_SECRET and tokens.refresh_token)
 
-    headers = {
-        "Content-Type": "application/json",
-        "trakt-api-version": TRAKT_API_VERSION,
-        "trakt-api-key": TRAKT_CLIENT_ID,
-        "Authorization": f"Bearer {TRAKT_ACCESS_TOKEN}",
+
+def refresh_trakt_token(tokens: TraktTokens) -> None:
+    """使用 refresh_token 换取新的 Trakt access_token，并写回 GitHub Secrets。"""
+    if not can_refresh_trakt_token(tokens):
+        raise ConfigError("无法刷新 Trakt token：缺少 TRAKT_CLIENT_SECRET 或 TRAKT_REFRESH_TOKEN")
+
+    # 先确认 GitHub Secrets 可写，再调用 Trakt 刷新接口，避免拿到新 refresh_token 后无法保存。
+    verify_secret_write_access(tokens)
+
+    payload = {
+        "refresh_token": tokens.refresh_token,
+        "client_id": TRAKT_CLIENT_ID,
+        "client_secret": TRAKT_CLIENT_SECRET,
+        "redirect_uri": TRAKT_REDIRECT_URI,
+        "grant_type": "refresh_token",
     }
 
     try:
-        response = requests.get(url, headers=headers, timeout=REQUEST_TIMEOUT)
+        response = requests.post(
+            "https://api.trakt.tv/oauth/token",
+            json=payload,
+            timeout=REQUEST_TIMEOUT,
+        )
+    except requests.RequestException as exc:
+        raise RuntimeError(f"刷新 Trakt token 请求失败：{exc}") from exc
+
+    if response.status_code >= 400:
+        raise RuntimeError(
+            f"刷新 Trakt token 失败：HTTP {response.status_code} - {response.text[:500]}"
+        )
+
+    try:
+        data = response.json()
+    except ValueError as exc:
+        raise RuntimeError(f"刷新 Trakt token 响应不是合法 JSON：{exc}") from exc
+
+    new_access_token = safe_text(data.get("access_token"), "")
+    new_refresh_token = safe_text(data.get("refresh_token"), tokens.refresh_token)
+
+    if not new_access_token:
+        raise RuntimeError("刷新 Trakt token 失败：响应中缺少 access_token")
+
+    tokens.access_token = new_access_token
+    tokens.refresh_token = new_refresh_token
+
+    persist_github_secret("TRAKT_ACCESS_TOKEN", tokens.access_token)
+    persist_github_secret("TRAKT_REFRESH_TOKEN", tokens.refresh_token)
+
+    expires_in = data.get("expires_in")
+    if expires_in:
+        logging.info("Trakt token 已刷新并写回 GitHub Secrets，expires_in=%s。", expires_in)
+    else:
+        logging.info("Trakt token 已刷新并写回 GitHub Secrets。")
+
+
+def verify_secret_write_access(tokens: TraktTokens) -> None:
+    """刷新前做一次 Secrets 写权限预检，降低 refresh_token 轮换后丢失的风险。"""
+    if tokens.access_token:
+        persist_github_secret("TRAKT_ACCESS_TOKEN", tokens.access_token, quiet=True)
+    persist_github_secret("TRAKT_REFRESH_TOKEN", tokens.refresh_token, quiet=True)
+
+
+def persist_github_secret(name: str, value: str, quiet: bool = False) -> None:
+    """通过 gh CLI 更新仓库 Secret；不把敏感值写入日志或仓库文件。"""
+    if not value:
+        raise RuntimeError(f"无法写入 GitHub Secret {name}：值为空")
+
+    if not GITHUB_REPOSITORY:
+        raise RuntimeError("无法写入 GitHub Secret：缺少 GITHUB_REPOSITORY 环境变量")
+
+    gh_path = shutil.which("gh")
+    if not gh_path:
+        raise RuntimeError("无法写入 GitHub Secret：当前环境没有安装 gh CLI")
+
+    env = os.environ.copy()
+    token = env.get("GH_TOKEN") or env.get("GITHUB_TOKEN")
+    if token and not env.get("GH_TOKEN"):
+        env["GH_TOKEN"] = token
+
+    if not env.get("GH_TOKEN"):
+        raise RuntimeError("无法写入 GitHub Secret：缺少 GH_TOKEN 或 GITHUB_TOKEN")
+
+    try:
+        completed = subprocess.run(
+            [gh_path, "secret", "set", name, "--repo", GITHUB_REPOSITORY],
+            input=value,
+            text=True,
+            capture_output=True,
+            timeout=60,
+            env=env,
+            check=False,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError(f"写入 GitHub Secret {name} 超时") from exc
+    except OSError as exc:
+        raise RuntimeError(f"写入 GitHub Secret {name} 失败：{exc}") from exc
+
+    if completed.returncode != 0:
+        stderr = completed.stderr.strip() or completed.stdout.strip()
+        raise RuntimeError(f"写入 GitHub Secret {name} 失败：{stderr[:500]}")
+
+    if not quiet:
+        logging.info("已更新 GitHub Secret：%s。", name)
+
+
+def trakt_headers(access_token: str) -> Dict[str, str]:
+    return {
+        "Content-Type": "application/json",
+        "trakt-api-version": TRAKT_API_VERSION,
+        "trakt-api-key": TRAKT_CLIENT_ID,
+        "Authorization": f"Bearer {access_token}",
+    }
+
+
+def request_today_calendar(tokens: TraktTokens) -> requests.Response:
+    start_date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    url = f"https://api.trakt.tv/calendars/my/shows/{start_date}/{TRAKT_CALENDAR_DAYS}"
+
+    try:
+        return requests.get(url, headers=trakt_headers(tokens.access_token), timeout=REQUEST_TIMEOUT)
     except requests.RequestException as exc:
         raise RuntimeError(f"请求 Trakt API 失败：{exc}") from exc
+
+
+def fetch_today_calendar(tokens: TraktTokens) -> List[Dict[str, Any]]:
+    """调用 Trakt 个人日历接口，401 时自动刷新 token 并重试一次。"""
+    if TRAKT_FORCE_REFRESH or not tokens.access_token:
+        logging.info("开始刷新 Trakt token。")
+        refresh_trakt_token(tokens)
+
+    response = request_today_calendar(tokens)
+    if response.status_code == 401 and can_refresh_trakt_token(tokens):
+        logging.warning("Trakt access_token 已失效，开始自动续期。")
+        refresh_trakt_token(tokens)
+        response = request_today_calendar(tokens)
 
     if response.status_code >= 400:
         raise RuntimeError(
@@ -335,10 +487,15 @@ def main() -> int:
     try:
         require_config()
 
+        tokens = TraktTokens(
+            access_token=TRAKT_ACCESS_TOKEN,
+            refresh_token=TRAKT_REFRESH_TOKEN,
+        )
+
         pushed_ids = load_pushed_ids()
         pushed_set = set(pushed_ids)
 
-        calendar_items = fetch_today_calendar()
+        calendar_items = fetch_today_calendar(tokens)
 
         new_episodes = []
         new_ids = []
