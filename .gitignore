@@ -1,6 +1,7 @@
 __pycache__/
 *.py[cod]
 .env
+新建文本文档.txt
 .venv/
 venv/
 .pytest_cache/
