@@ -2,7 +2,7 @@ name: Trakt Streaming Update Bot
 
 on:
   schedule:
-    - cron: "0 * * * *"
+    - cron: "*/30 * * * *"
   workflow_dispatch:
 
 permissions:
@@ -48,6 +48,15 @@ jobs:
           JUSTWATCH_ITEMS_PER_PROVIDER: ${{ vars.JUSTWATCH_ITEMS_PER_PROVIDER || '10' }}
           JUSTWATCH_MAX_ITEMS: ${{ vars.JUSTWATCH_MAX_ITEMS || '100' }}
           JUSTWATCH_MAX_AGE_DAYS: ${{ vars.JUSTWATCH_MAX_AGE_DAYS || '14' }}
+          FFZY_ENABLED: ${{ vars.FFZY_ENABLED || 'true' }}
+          FFZY_DOMAINS: ${{ vars.FFZY_DOMAINS || 'ffzy1.tv,ffzy2.tv,ffzy3.tv,ffzy4.tv,ffzy5.tv' }}
+          FFZY_BOOTSTRAP_ONLY: ${{ vars.FFZY_BOOTSTRAP_ONLY || 'true' }}
+          FFZY_TYPE_IDS: ${{ vars.FFZY_TYPE_IDS || '13,14,15,16,29,30,31' }}
+          FFZY_ITEMS_PER_TYPE: ${{ vars.FFZY_ITEMS_PER_TYPE || '20' }}
+          FFZY_PAGES_PER_TYPE: ${{ vars.FFZY_PAGES_PER_TYPE || '1' }}
+          FFZY_MAX_ITEMS: ${{ vars.FFZY_MAX_ITEMS || '200' }}
+          FFZY_MAX_AGE_HOURS: ${{ vars.FFZY_MAX_AGE_HOURS || '168' }}
+          FFZY_REQUEST_TIMEOUT: ${{ vars.FFZY_REQUEST_TIMEOUT || '8' }}
         run: python trakt_bot.py
 
       - name: Commit pushed episode state

@@ -1,3 +1,4 @@
+import html
 import json
 import logging
 import os
@@ -8,7 +9,7 @@ import sys
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 from urllib.parse import unquote, urljoin, urlparse
 
 import requests
@@ -40,7 +41,7 @@ TRAKT_API_VERSION = "2"
 TRAKT_CALENDAR_DAYS = 1
 TRAKT_REDIRECT_URI = os.getenv("TRAKT_REDIRECT_URI", "urn:ietf:wg:oauth:2.0:oob").strip()
 REQUEST_TIMEOUT = 20
-MAX_STATE_RECORDS = 500
+MAX_STATE_RECORDS = 5000
 
 DEFAULT_JUSTWATCH_PROVIDERS: List[str] = []
 DEFAULT_JUSTWATCH_URLS = [
@@ -110,6 +111,31 @@ query GetNewTitles(
   }
 }
 """
+
+DEFAULT_FFZY_DOMAINS = [
+    "ffzy1.tv",
+    "ffzy2.tv",
+    "ffzy3.tv",
+    "ffzy4.tv",
+    "ffzy5.tv",
+]
+DEFAULT_FFZY_TYPE_IDS = ["13", "14", "15", "16", "29", "30", "31"]
+DEFAULT_FFZY_TYPE_NAMES = ["国产剧", "香港剧", "韩国剧", "欧美剧", "国产动漫", "日韩动漫", "欧美动漫"]
+FFZY_ENABLED = parse_bool_env("FFZY_ENABLED", False)
+FFZY_DOMAINS = split_env_list(os.getenv("FFZY_DOMAINS", "")) or DEFAULT_FFZY_DOMAINS
+FFZY_TYPE_IDS = split_env_list(os.getenv("FFZY_TYPE_IDS", "")) or DEFAULT_FFZY_TYPE_IDS
+FFZY_TYPE_ID_SET = set(FFZY_TYPE_IDS)
+FFZY_TYPE_NAME_SET = set(DEFAULT_FFZY_TYPE_NAMES)
+FFZY_BOOTSTRAP_ONLY = parse_bool_env("FFZY_BOOTSTRAP_ONLY", True)
+FFZY_ITEMS_PER_TYPE = max(1, parse_int_env("FFZY_ITEMS_PER_TYPE", 20))
+FFZY_PAGES_PER_TYPE = max(1, parse_int_env("FFZY_PAGES_PER_TYPE", 1))
+FFZY_MAX_ITEMS = max(1, parse_int_env("FFZY_MAX_ITEMS", 200))
+FFZY_MAX_AGE_HOURS = max(0, parse_int_env("FFZY_MAX_AGE_HOURS", 168))
+FFZY_REQUEST_TIMEOUT = max(1, parse_int_env("FFZY_REQUEST_TIMEOUT", 8))
+FFZY_USER_AGENT = os.getenv(
+    "FFZY_USER_AGENT",
+    "Mozilla/5.0 (compatible; trakt-streaming-update-bot/1.0)",
+).strip()
 JUSTWATCH_BUCKETS_GRAPHQL_QUERY = """
 query GetNewTitleBuckets(
   $country: Country!
@@ -235,7 +261,7 @@ def load_pushed_ids() -> List[str]:
 
 
 def save_pushed_ids(ids: Sequence[str]) -> None:
-    """原子写入状态文件，限制最多保留最新 500 条记录。"""
+    """原子写入状态文件，限制最多保留最新 MAX_STATE_RECORDS 条记录。"""
     normalized = dedupe_keep_order([str(item) for item in ids if item is not None])
     normalized = normalized[-MAX_STATE_RECORDS:]
 
@@ -720,6 +746,225 @@ def fetch_justwatch_page_items(url: str) -> List[Dict[str, str]]:
     return items
 
 
+def fetch_ffzy_items() -> List[Dict[str, str]]:
+    """Fetch selected FFZY categories and convert them to push items."""
+    if not FFZY_ENABLED:
+        return []
+
+    domains = [domain for domain in FFZY_DOMAINS if domain.strip()]
+    if not domains:
+        logging.warning("FFZY 已启用但没有配置可用域名。")
+        return []
+
+    items: List[Dict[str, str]] = []
+    seen = set()
+
+    for type_id in FFZY_TYPE_IDS:
+        type_count = 0
+        for page in range(1, FFZY_PAGES_PER_TYPE + 1):
+            if type_count >= FFZY_ITEMS_PER_TYPE or len(items) >= FFZY_MAX_ITEMS:
+                break
+
+            try:
+                data, api_base = request_ffzy_json({"ac": "detail", "t": type_id, "pg": page}, domains)
+            except Exception as exc:
+                logging.exception("查询 FFZY 分类失败，本次跳过分类 %s：%s", type_id, exc)
+                break
+
+            entries = data.get("list") or []
+            if not isinstance(entries, list):
+                logging.warning("FFZY 分类 %s 响应 list 不是数组，本次跳过。", type_id)
+                break
+            if not entries:
+                break
+
+            for entry in entries:
+                if type_count >= FFZY_ITEMS_PER_TYPE or len(items) >= FFZY_MAX_ITEMS:
+                    break
+                if not isinstance(entry, dict):
+                    continue
+
+                item = extract_ffzy_item(entry, api_base)
+                if not item or item["key"] in seen:
+                    continue
+
+                items.append(item)
+                seen.add(item["key"])
+                type_count += 1
+
+            page_count = parse_positive_int(data.get("pagecount"), 1)
+            if page >= page_count:
+                break
+
+        logging.info("FFZY 分类 %s 解析到 %s 个最新条目。", type_id, type_count)
+
+    items.sort(key=lambda item: item.get("aired", ""), reverse=True)
+    return items[:FFZY_MAX_ITEMS]
+
+
+def request_ffzy_json(params: Dict[str, Any], domains: List[str]) -> Tuple[Dict[str, Any], str]:
+    errors = []
+    headers = {
+        "Accept": "application/json,text/plain,*/*",
+        "User-Agent": FFZY_USER_AGENT,
+    }
+
+    for domain in list(domains):
+        api_base = normalize_ffzy_api_base(domain)
+        if not api_base:
+            continue
+
+        try:
+            response = requests.get(api_base, params=params, headers=headers, timeout=FFZY_REQUEST_TIMEOUT)
+        except requests.RequestException as exc:
+            errors.append(f"{domain}: {exc}")
+            continue
+
+        if response.status_code >= 400:
+            errors.append(f"{domain}: HTTP {response.status_code}")
+            continue
+
+        try:
+            data = response.json()
+        except ValueError as exc:
+            errors.append(f"{domain}: JSON 解析失败 {exc}")
+            continue
+
+        if not isinstance(data, dict):
+            errors.append(f"{domain}: 响应顶层不是对象")
+            continue
+
+        if "list" not in data:
+            errors.append(f"{domain}: 响应缺少 list 字段")
+            continue
+
+        if domain != domains[0]:
+            domains.remove(domain)
+            domains.insert(0, domain)
+            logging.info("FFZY 当前使用备用域名：%s", domain)
+
+        return data, api_base
+
+    raise RuntimeError("所有 FFZY 域名都请求失败：" + "; ".join(errors[-5:]))
+
+
+def normalize_ffzy_api_base(domain: str) -> str:
+    base = domain.strip()
+    if not base:
+        return ""
+    if "://" not in base:
+        base = f"http://{base}"
+
+    base = base.rstrip("/")
+    path = urlparse(base).path.rstrip("/")
+    if path.endswith("/api.php/provide/vod"):
+        return f"{base}/"
+    return f"{base}/api.php/provide/vod/"
+
+
+def extract_ffzy_item(entry: Dict[str, Any], api_base: str) -> Optional[Dict[str, str]]:
+    type_id = safe_text(entry.get("type_id"), "")
+    type_name = clean_ffzy_text(entry.get("type_name"), "")
+    if type_id and type_id not in FFZY_TYPE_ID_SET:
+        return None
+    if not type_id and type_name not in FFZY_TYPE_NAME_SET:
+        return None
+
+    vod_id = safe_text(entry.get("vod_id"), "")
+    title = clean_ffzy_text(entry.get("vod_name"), "")
+    if not title:
+        return None
+
+    updated_at = clean_ffzy_text(entry.get("vod_time"), "")
+    if updated_at and not is_recent_ffzy_time(updated_at):
+        return None
+
+    remarks = clean_ffzy_text(entry.get("vod_remarks"), "")
+    key_id = vod_id or clean_ffzy_key_part(title)
+    key_time = updated_at or remarks or safe_text(entry.get("vod_en"), "")
+    key = f"ffzy:{clean_ffzy_key_part(key_id)}:{clean_ffzy_key_part(key_time)}"
+
+    domain = ffzy_domain_label(api_base)
+    source_parts = ["FFZY", domain]
+    if type_name:
+        source_parts.append(type_name)
+
+    return {
+        "key": key,
+        "type": "ffzy",
+        "label": f"FFZY {type_name or type_id}",
+        "title": title,
+        "subtitle": remarks,
+        "code": type_name or type_id,
+        "aired": updated_at or "未知",
+        "time_label": "更新时间",
+        "source": " · ".join(source_parts),
+        "url": ffzy_detail_api_url(api_base, vod_id),
+    }
+
+
+def clean_ffzy_text(value: Any, fallback: str) -> str:
+    text = safe_text(value, "")
+    if not text:
+        return fallback
+    text = html.unescape(text)
+    text = re.sub(r"<[^>]+>", "", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    return text or fallback
+
+
+def clean_ffzy_key_part(value: Any) -> str:
+    text = safe_text(value, "")
+    text = re.sub(r"\s+", "_", text)
+    return re.sub(r"[^0-9A-Za-z_.:-]+", "_", text).strip("_") or "unknown"
+
+
+def ffzy_detail_api_url(api_base: str, vod_id: str) -> str:
+    if not vod_id:
+        return ""
+    return f"{api_base}?ac=detail&ids={vod_id}"
+
+
+def ffzy_domain_label(api_base: str) -> str:
+    parsed = urlparse(api_base)
+    return parsed.netloc or api_base
+
+
+def is_recent_ffzy_time(value: str) -> bool:
+    if FFZY_MAX_AGE_HOURS <= 0 or not value or value == "未知":
+        return True
+
+    item_time = parse_ffzy_datetime(value)
+    if item_time is None:
+        return True
+
+    cn_tz = timezone(timedelta(hours=8))
+    now = datetime.now(cn_tz).replace(tzinfo=None)
+    return now - timedelta(hours=FFZY_MAX_AGE_HOURS) <= item_time <= now + timedelta(hours=2)
+
+
+def parse_ffzy_datetime(value: str) -> Optional[datetime]:
+    text = value.strip()
+    for fmt, length in (
+        ("%Y-%m-%d %H:%M:%S", 19),
+        ("%Y-%m-%d %H:%M", 16),
+        ("%Y-%m-%d", 10),
+    ):
+        try:
+            return datetime.strptime(text[:length], fmt)
+        except ValueError:
+            continue
+    return None
+
+
+def parse_positive_int(value: Any, default: int) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return default
+    return parsed if parsed > 0 else default
+
+
 def extract_justwatch_apollo_state(html: str) -> Dict[str, Any]:
     match = re.search(
         r'<script type="application/json" data-nuxt-data="nuxt-app"[^>]*>(.*?)</script>',
@@ -1119,6 +1364,7 @@ def main() -> int:
 
         calendar_items = fetch_today_items(tokens)
         justwatch_items = fetch_justwatch_items()
+        ffzy_items = fetch_ffzy_items()
 
         baseline_ids: List[str] = []
         if justwatch_items and JUSTWATCH_BOOTSTRAP_ONLY and not any(
@@ -1138,6 +1384,25 @@ def main() -> int:
         else:
             calendar_items.extend(justwatch_items)
 
+        if ffzy_items and FFZY_BOOTSTRAP_ONLY and not any(
+            item.startswith("ffzy:") for item in pushed_ids
+        ):
+            ffzy_baseline_count = 0
+            for item in ffzy_items:
+                item_key = item["key"]
+                if item_key in pushed_set:
+                    continue
+                baseline_ids.append(item_key)
+                pushed_set.add(item_key)
+                ffzy_baseline_count += 1
+
+            logging.info(
+                "FFZY 首次运行已建立 %s 条基线记录，本次不推送这些历史条目。",
+                ffzy_baseline_count,
+            )
+        else:
+            calendar_items.extend(ffzy_items)
+
         new_items = []
         new_ids = []
         seen_this_run = set()
@@ -1154,7 +1419,7 @@ def main() -> int:
         if not new_items:
             if baseline_ids:
                 save_pushed_ids(pushed_ids + baseline_ids)
-                logging.info("已更新 pushed_episodes.json，新增 %s 条 JustWatch 基线记录。", len(baseline_ids))
+                logging.info("已更新 pushed_episodes.json，新增 %s 条基线记录。", len(baseline_ids))
             logging.info("没有发现需要推送的新剧集或电影。")
             return 0
 

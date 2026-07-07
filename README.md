@@ -1,8 +1,10 @@
 # Trakt Streaming Update Bot
 
-GitHub Actions 每小时运行一次，读取 Trakt.tv 个人剧集和电影日历，并推送新上架内容到 Telegram 或 Discord。
+GitHub Actions 每 30 分钟运行一次，读取 Trakt.tv 个人剧集和电影日历，并推送新上架内容到 Telegram 或 Discord。
 
 脚本也支持 JustWatch 最新上架追踪。JustWatch 没有公开的中国大陆区域，默认追踪台湾 JustWatch 最新上架页。
+
+脚本还支持 FFZY 采集接口追踪，会按备用域名顺序尝试 `ffzy1.tv` 到 `ffzy5.tv`，只推送指定剧集和动漫分类的新更新。
 
 ## GitHub Secrets
 
@@ -37,7 +39,7 @@ GitHub Actions 每小时运行一次，读取 Trakt.tv 个人剧集和电影日�
 
 ## 运行方式
 
-推送到 GitHub 后，工作流会按 UTC 每小时整点运行，也可以在 Actions 页面手动触发。
+推送到 GitHub 后，工作流会按 UTC 每 30 分钟运行一次，也可以在 Actions 页面手动触发。
 
 脚本会读取：
 
@@ -61,3 +63,32 @@ GitHub Actions 默认启用 JustWatch。首次启用时，脚本会把当前 Jus
 - `JUSTWATCH_ITEMS_PER_PROVIDER`：每个平台每次最多取多少个 JustWatch 条目，默认 `10`
 - `JUSTWATCH_MAX_ITEMS`：每次最多处理多少个 JustWatch 条目，默认 `100`
 - `JUSTWATCH_MAX_AGE_DAYS`：只处理最近多少天的 JustWatch 上架条目，默认 `14`；设为 `0` 表示不过滤日期
+
+## FFZY 追踪
+
+GitHub Actions 默认启用 FFZY。首次启用时，脚本会把当前 FFZY 最新条目写入基线状态，但不会把这些历史条目一次性推送出去；后续同一资源出现新的 `vod_time` 才会推送。
+
+默认备用域名：
+
+- `ffzy1.tv`
+- `ffzy2.tv`
+- `ffzy3.tv`
+- `ffzy4.tv`
+- `ffzy5.tv`
+
+默认只追踪这些分类：
+
+- 连续剧：`13` 国产剧、`14` 香港剧、`15` 韩国剧、`16` 欧美剧
+- 动漫片：`29` 国产动漫、`30` 日韩动漫、`31` 欧美动漫
+
+可以在仓库 Settings -> Secrets and variables -> Actions -> Variables 中调整：
+
+- `FFZY_ENABLED`：是否启用，默认 `true`
+- `FFZY_DOMAINS`：备用域名列表，多个值用逗号或换行分隔，默认 `ffzy1.tv,ffzy2.tv,ffzy3.tv,ffzy4.tv,ffzy5.tv`
+- `FFZY_BOOTSTRAP_ONLY`：首次启用是否只建立基线，默认 `true`
+- `FFZY_TYPE_IDS`：要追踪的分类 ID，多个值用逗号或换行分隔，默认 `13,14,15,16,29,30,31`
+- `FFZY_ITEMS_PER_TYPE`：每个分类每次最多处理多少条，默认 `20`
+- `FFZY_PAGES_PER_TYPE`：每个分类每次最多请求多少页，默认 `1`
+- `FFZY_MAX_ITEMS`：每次最多处理多少个 FFZY 条目，默认 `200`
+- `FFZY_MAX_AGE_HOURS`：只处理最近多少小时的 FFZY 更新，默认 `168`；设为 `0` 表示不过滤时间
+- `FFZY_REQUEST_TIMEOUT`：单个 FFZY 域名请求超时时间，默认 `8` 秒
