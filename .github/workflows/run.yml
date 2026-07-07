@@ -40,7 +40,7 @@ jobs:
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
-          GH_TOKEN: ${{ github.token }}
+          GH_SECRET_WRITE_TOKEN: ${{ secrets.GH_SECRET_WRITE_TOKEN }}
         run: python trakt_bot.py
 
       - name: Commit pushed episode state

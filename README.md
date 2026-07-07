@@ -13,6 +13,9 @@ GitHub Actions 每小时运行一次，读取 Trakt.tv 个人剧集和电影日�
 
 - `TRAKT_CLIENT_SECRET`
 - `TRAKT_REFRESH_TOKEN`
+- `GH_SECRET_WRITE_TOKEN`
+
+`GH_SECRET_WRITE_TOKEN` 需要是一个 GitHub PAT，并且对当前仓库具备 Actions Secrets 写权限。推荐使用 fine-grained PAT，只选择这个仓库，并授予 Repository permissions -> Secrets -> Read and write。也可以使用 classic PAT，私有仓库至少需要 `repo` scope。不要使用工作流自带的 `github.token`，它不能更新仓库 Secrets。
 
 至少配置一个推送渠道：
 
@@ -23,7 +26,7 @@ GitHub Actions 每小时运行一次，读取 Trakt.tv 个人剧集和电影日�
 
 当 Trakt 返回 401 时，脚本会使用 `TRAKT_REFRESH_TOKEN` 自动换取新的 `access_token` 和 `refresh_token`。
 
-刷新成功后，脚本会通过 GitHub CLI 写回仓库 Secrets：
+刷新成功后，脚本会通过 GitHub CLI 和 `GH_SECRET_WRITE_TOKEN` 写回仓库 Secrets：
 
 - `TRAKT_ACCESS_TOKEN`
 - `TRAKT_REFRESH_TOKEN`

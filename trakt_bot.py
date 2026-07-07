@@ -37,6 +37,7 @@ TG_CHAT_ID = os.getenv("TG_CHAT_ID", "").strip()
 DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL", "").strip()
 
 GITHUB_REPOSITORY = os.getenv("GITHUB_REPOSITORY", "").strip()
+GH_SECRET_WRITE_TOKEN = os.getenv("GH_SECRET_WRITE_TOKEN", "").strip()
 
 
 logging.basicConfig(
@@ -216,12 +217,14 @@ def persist_github_secret(name: str, value: str, quiet: bool = False) -> None:
         raise RuntimeError("无法写入 GitHub Secret：当前环境没有安装 gh CLI")
 
     env = os.environ.copy()
-    token = env.get("GH_TOKEN") or env.get("GITHUB_TOKEN")
-    if token and not env.get("GH_TOKEN"):
+    token = GH_SECRET_WRITE_TOKEN or env.get("GH_TOKEN") or env.get("GITHUB_TOKEN")
+    if token:
         env["GH_TOKEN"] = token
 
     if not env.get("GH_TOKEN"):
-        raise RuntimeError("无法写入 GitHub Secret：缺少 GH_TOKEN 或 GITHUB_TOKEN")
+        raise RuntimeError(
+            "无法写入 GitHub Secret：缺少 GH_SECRET_WRITE_TOKEN、GH_TOKEN 或 GITHUB_TOKEN"
+        )
 
     try:
         completed = subprocess.run(
@@ -240,7 +243,14 @@ def persist_github_secret(name: str, value: str, quiet: bool = False) -> None:
 
     if completed.returncode != 0:
         stderr = completed.stderr.strip() or completed.stdout.strip()
-        raise RuntimeError(f"写入 GitHub Secret {name} 失败：{stderr[:500]}")
+        hint = ""
+        if "Resource not accessible by integration" in stderr or "HTTP 403" in stderr:
+            hint = (
+                "；当前 token 没有仓库 Actions Secrets 写权限。"
+                "在 GitHub Actions 中请配置 GH_SECRET_WRITE_TOKEN 为具备 Secrets: write 权限的 PAT，"
+                "不要使用 github.token"
+            )
+        raise RuntimeError(f"写入 GitHub Secret {name} 失败：{stderr[:500]}{hint}")
 
     if not quiet:
         logging.info("已更新 GitHub Secret：%s。", name)
