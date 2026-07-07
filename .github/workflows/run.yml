@@ -57,6 +57,15 @@ jobs:
           FFZY_MAX_ITEMS: ${{ vars.FFZY_MAX_ITEMS || '200' }}
           FFZY_MAX_AGE_HOURS: ${{ vars.FFZY_MAX_AGE_HOURS || '168' }}
           FFZY_REQUEST_TIMEOUT: ${{ vars.FFZY_REQUEST_TIMEOUT || '8' }}
+          BFZY_ENABLED: ${{ vars.BFZY_ENABLED || 'true' }}
+          BFZY_DOMAINS: ${{ vars.BFZY_DOMAINS || 'bfzyapi.com,bfzy.tv' }}
+          BFZY_BOOTSTRAP_ONLY: ${{ vars.BFZY_BOOTSTRAP_ONLY || 'true' }}
+          BFZY_TYPE_IDS: ${{ vars.BFZY_TYPE_IDS || '31,33,34,32,40,41,42' }}
+          BFZY_ITEMS_PER_TYPE: ${{ vars.BFZY_ITEMS_PER_TYPE || '20' }}
+          BFZY_PAGES_PER_TYPE: ${{ vars.BFZY_PAGES_PER_TYPE || '1' }}
+          BFZY_MAX_ITEMS: ${{ vars.BFZY_MAX_ITEMS || '200' }}
+          BFZY_MAX_AGE_HOURS: ${{ vars.BFZY_MAX_AGE_HOURS || '168' }}
+          BFZY_REQUEST_TIMEOUT: ${{ vars.BFZY_REQUEST_TIMEOUT || '8' }}
         run: python trakt_bot.py
 
       - name: Commit pushed episode state

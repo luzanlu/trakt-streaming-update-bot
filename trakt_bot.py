@@ -6,6 +6,7 @@ import re
 import shutil
 import subprocess
 import sys
+import unicodedata
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -124,8 +125,6 @@ DEFAULT_FFZY_TYPE_NAMES = ["国产剧", "香港剧", "韩国剧", "欧美剧", "
 FFZY_ENABLED = parse_bool_env("FFZY_ENABLED", False)
 FFZY_DOMAINS = split_env_list(os.getenv("FFZY_DOMAINS", "")) or DEFAULT_FFZY_DOMAINS
 FFZY_TYPE_IDS = split_env_list(os.getenv("FFZY_TYPE_IDS", "")) or DEFAULT_FFZY_TYPE_IDS
-FFZY_TYPE_ID_SET = set(FFZY_TYPE_IDS)
-FFZY_TYPE_NAME_SET = set(DEFAULT_FFZY_TYPE_NAMES)
 FFZY_BOOTSTRAP_ONLY = parse_bool_env("FFZY_BOOTSTRAP_ONLY", True)
 FFZY_ITEMS_PER_TYPE = max(1, parse_int_env("FFZY_ITEMS_PER_TYPE", 20))
 FFZY_PAGES_PER_TYPE = max(1, parse_int_env("FFZY_PAGES_PER_TYPE", 1))
@@ -134,6 +133,34 @@ FFZY_MAX_AGE_HOURS = max(0, parse_int_env("FFZY_MAX_AGE_HOURS", 168))
 FFZY_REQUEST_TIMEOUT = max(1, parse_int_env("FFZY_REQUEST_TIMEOUT", 8))
 FFZY_USER_AGENT = os.getenv(
     "FFZY_USER_AGENT",
+    "Mozilla/5.0 (compatible; trakt-streaming-update-bot/1.0)",
+).strip()
+
+DEFAULT_BFZY_DOMAINS = [
+    "bfzyapi.com",
+    "bfzy.tv",
+]
+DEFAULT_BFZY_TYPE_IDS = ["31", "33", "34", "32", "40", "41", "42"]
+DEFAULT_BFZY_TYPE_NAMES = [
+    "国产剧",
+    "香港剧",
+    "韩国剧",
+    "欧美剧",
+    "国产动漫",
+    "日韩动漫",
+    "欧美动漫",
+]
+BFZY_ENABLED = parse_bool_env("BFZY_ENABLED", False)
+BFZY_DOMAINS = split_env_list(os.getenv("BFZY_DOMAINS", "")) or DEFAULT_BFZY_DOMAINS
+BFZY_TYPE_IDS = split_env_list(os.getenv("BFZY_TYPE_IDS", "")) or DEFAULT_BFZY_TYPE_IDS
+BFZY_BOOTSTRAP_ONLY = parse_bool_env("BFZY_BOOTSTRAP_ONLY", True)
+BFZY_ITEMS_PER_TYPE = max(1, parse_int_env("BFZY_ITEMS_PER_TYPE", 20))
+BFZY_PAGES_PER_TYPE = max(1, parse_int_env("BFZY_PAGES_PER_TYPE", 1))
+BFZY_MAX_ITEMS = max(1, parse_int_env("BFZY_MAX_ITEMS", 200))
+BFZY_MAX_AGE_HOURS = max(0, parse_int_env("BFZY_MAX_AGE_HOURS", 168))
+BFZY_REQUEST_TIMEOUT = max(1, parse_int_env("BFZY_REQUEST_TIMEOUT", 8))
+BFZY_USER_AGENT = os.getenv(
+    "BFZY_USER_AGENT",
     "Mozilla/5.0 (compatible; trakt-streaming-update-bot/1.0)",
 ).strip()
 JUSTWATCH_BUCKETS_GRAPHQL_QUERY = """
@@ -202,6 +229,23 @@ class ConfigError(RuntimeError):
 class TraktTokens:
     access_token: str
     refresh_token: str
+
+
+@dataclass
+class ResourceSiteConfig:
+    code: str
+    display_name: str
+    enabled: bool
+    domains: List[str]
+    type_ids: List[str]
+    type_names: List[str]
+    bootstrap_only: bool
+    items_per_type: int
+    pages_per_type: int
+    max_items: int
+    max_age_hours: int
+    request_timeout: int
+    user_agent: str
 
 
 def require_config() -> None:
@@ -746,76 +790,133 @@ def fetch_justwatch_page_items(url: str) -> List[Dict[str, str]]:
     return items
 
 
+def ffzy_site_config() -> ResourceSiteConfig:
+    return ResourceSiteConfig(
+        code="ffzy",
+        display_name="FFZY",
+        enabled=FFZY_ENABLED,
+        domains=list(FFZY_DOMAINS),
+        type_ids=list(FFZY_TYPE_IDS),
+        type_names=list(DEFAULT_FFZY_TYPE_NAMES),
+        bootstrap_only=FFZY_BOOTSTRAP_ONLY,
+        items_per_type=FFZY_ITEMS_PER_TYPE,
+        pages_per_type=FFZY_PAGES_PER_TYPE,
+        max_items=FFZY_MAX_ITEMS,
+        max_age_hours=FFZY_MAX_AGE_HOURS,
+        request_timeout=FFZY_REQUEST_TIMEOUT,
+        user_agent=FFZY_USER_AGENT,
+    )
+
+
+def bfzy_site_config() -> ResourceSiteConfig:
+    return ResourceSiteConfig(
+        code="bfzy",
+        display_name="BFZY",
+        enabled=BFZY_ENABLED,
+        domains=list(BFZY_DOMAINS),
+        type_ids=list(BFZY_TYPE_IDS),
+        type_names=list(DEFAULT_BFZY_TYPE_NAMES),
+        bootstrap_only=BFZY_BOOTSTRAP_ONLY,
+        items_per_type=BFZY_ITEMS_PER_TYPE,
+        pages_per_type=BFZY_PAGES_PER_TYPE,
+        max_items=BFZY_MAX_ITEMS,
+        max_age_hours=BFZY_MAX_AGE_HOURS,
+        request_timeout=BFZY_REQUEST_TIMEOUT,
+        user_agent=BFZY_USER_AGENT,
+    )
+
+
 def fetch_ffzy_items() -> List[Dict[str, str]]:
-    """Fetch selected FFZY categories and convert them to push items."""
-    if not FFZY_ENABLED:
+    """抓取 FFZY 指定分类，解析成统一推送条目。"""
+    return fetch_resource_site_items(ffzy_site_config())
+
+
+def fetch_bfzy_items() -> List[Dict[str, str]]:
+    """抓取 BFZY 指定分类，解析成统一推送条目。"""
+    return fetch_resource_site_items(bfzy_site_config())
+
+
+def fetch_resource_site_items(config: ResourceSiteConfig) -> List[Dict[str, str]]:
+    """Fetch selected resource-site categories and convert them to push items."""
+    if not config.enabled:
         return []
 
-    domains = [domain for domain in FFZY_DOMAINS if domain.strip()]
+    domains = [domain for domain in config.domains if domain.strip()]
     if not domains:
-        logging.warning("FFZY 已启用但没有配置可用域名。")
+        logging.warning("%s 已启用但没有配置可用域名。", config.display_name)
         return []
 
     items: List[Dict[str, str]] = []
     seen = set()
 
-    for type_id in FFZY_TYPE_IDS:
+    for type_id in config.type_ids:
         type_count = 0
-        for page in range(1, FFZY_PAGES_PER_TYPE + 1):
-            if type_count >= FFZY_ITEMS_PER_TYPE or len(items) >= FFZY_MAX_ITEMS:
+        for page in range(1, config.pages_per_type + 1):
+            if type_count >= config.items_per_type or len(items) >= config.max_items:
                 break
 
             try:
-                data, api_base = request_ffzy_json({"ac": "detail", "t": type_id, "pg": page}, domains)
+                data, api_base = request_resource_site_json(
+                    {"ac": "detail", "t": type_id, "pg": page},
+                    domains,
+                    config,
+                )
             except Exception as exc:
-                logging.exception("查询 FFZY 分类失败，本次跳过分类 %s：%s", type_id, exc)
+                logging.exception("查询 %s 分类失败，本次跳过分类 %s：%s", config.display_name, type_id, exc)
                 break
 
             entries = data.get("list") or []
             if not isinstance(entries, list):
-                logging.warning("FFZY 分类 %s 响应 list 不是数组，本次跳过。", type_id)
+                logging.warning("%s 分类 %s 响应 list 不是数组，本次跳过。", config.display_name, type_id)
                 break
             if not entries:
                 break
 
             for entry in entries:
-                if type_count >= FFZY_ITEMS_PER_TYPE or len(items) >= FFZY_MAX_ITEMS:
+                if type_count >= config.items_per_type or len(items) >= config.max_items:
                     break
                 if not isinstance(entry, dict):
                     continue
 
-                item = extract_ffzy_item(entry, api_base)
-                if not item or item["key"] in seen:
+                item = extract_resource_site_item(entry, api_base, config)
+                if not item:
+                    continue
+                item_keys = item_state_keys(item)
+                if any(key in seen for key in item_keys):
                     continue
 
                 items.append(item)
-                seen.add(item["key"])
+                seen.update(item_keys)
                 type_count += 1
 
             page_count = parse_positive_int(data.get("pagecount"), 1)
             if page >= page_count:
                 break
 
-        logging.info("FFZY 分类 %s 解析到 %s 个最新条目。", type_id, type_count)
+        logging.info("%s 分类 %s 解析到 %s 个最新条目。", config.display_name, type_id, type_count)
 
     items.sort(key=lambda item: item.get("aired", ""), reverse=True)
-    return items[:FFZY_MAX_ITEMS]
+    return items[: config.max_items]
 
 
-def request_ffzy_json(params: Dict[str, Any], domains: List[str]) -> Tuple[Dict[str, Any], str]:
+def request_resource_site_json(
+    params: Dict[str, Any],
+    domains: List[str],
+    config: ResourceSiteConfig,
+) -> Tuple[Dict[str, Any], str]:
     errors = []
     headers = {
         "Accept": "application/json,text/plain,*/*",
-        "User-Agent": FFZY_USER_AGENT,
+        "User-Agent": config.user_agent,
     }
 
     for domain in list(domains):
-        api_base = normalize_ffzy_api_base(domain)
+        api_base = normalize_resource_api_base(domain, config)
         if not api_base:
             continue
 
         try:
-            response = requests.get(api_base, params=params, headers=headers, timeout=FFZY_REQUEST_TIMEOUT)
+            response = requests.get(api_base, params=params, headers=headers, timeout=config.request_timeout)
         except requests.RequestException as exc:
             errors.append(f"{domain}: {exc}")
             continue
@@ -841,19 +942,25 @@ def request_ffzy_json(params: Dict[str, Any], domains: List[str]) -> Tuple[Dict[
         if domain != domains[0]:
             domains.remove(domain)
             domains.insert(0, domain)
-            logging.info("FFZY 当前使用备用域名：%s", domain)
+            logging.info("%s 当前使用备用域名：%s", config.display_name, domain)
 
         return data, api_base
 
-    raise RuntimeError("所有 FFZY 域名都请求失败：" + "; ".join(errors[-5:]))
+    raise RuntimeError(f"所有 {config.display_name} 域名都请求失败：" + "; ".join(errors[-5:]))
 
 
-def normalize_ffzy_api_base(domain: str) -> str:
+def normalize_resource_api_base(domain: str, config: ResourceSiteConfig) -> str:
     base = domain.strip()
     if not base:
         return ""
     if "://" not in base:
-        base = f"http://{base}"
+        scheme = "https" if config.code == "bfzy" else "http"
+        base = f"{scheme}://{base}"
+
+    parsed = urlparse(base)
+    host = parsed.netloc.lower()
+    if config.code == "bfzy" and host in {"bfzy.tv", "www.bfzy.tv"} and not parsed.path.strip("/"):
+        base = "https://bfzyapi.com"
 
     base = base.rstrip("/")
     path = urlparse(base).path.rstrip("/")
@@ -862,12 +969,16 @@ def normalize_ffzy_api_base(domain: str) -> str:
     return f"{base}/api.php/provide/vod/"
 
 
-def extract_ffzy_item(entry: Dict[str, Any], api_base: str) -> Optional[Dict[str, str]]:
+def extract_resource_site_item(
+    entry: Dict[str, Any],
+    api_base: str,
+    config: ResourceSiteConfig,
+) -> Optional[Dict[str, str]]:
     type_id = safe_text(entry.get("type_id"), "")
     type_name = clean_ffzy_text(entry.get("type_name"), "")
-    if type_id and type_id not in FFZY_TYPE_ID_SET:
+    if type_id and type_id not in set(config.type_ids):
         return None
-    if not type_id and type_name not in FFZY_TYPE_NAME_SET:
+    if not type_id and type_name not in set(config.type_names):
         return None
 
     vod_id = safe_text(entry.get("vod_id"), "")
@@ -876,30 +987,36 @@ def extract_ffzy_item(entry: Dict[str, Any], api_base: str) -> Optional[Dict[str
         return None
 
     updated_at = clean_ffzy_text(entry.get("vod_time"), "")
-    if updated_at and not is_recent_ffzy_time(updated_at):
+    if updated_at and not is_recent_resource_site_time(updated_at, config.max_age_hours):
         return None
 
     remarks = clean_ffzy_text(entry.get("vod_remarks"), "")
     key_id = vod_id or clean_ffzy_key_part(title)
     key_time = updated_at or remarks or safe_text(entry.get("vod_en"), "")
-    key = f"ffzy:{clean_ffzy_key_part(key_id)}:{clean_ffzy_key_part(key_time)}"
+    key = f"{config.code}:{clean_ffzy_key_part(key_id)}:{clean_ffzy_key_part(key_time)}"
 
-    domain = ffzy_domain_label(api_base)
-    source_parts = ["FFZY", domain]
+    dedupe_keys = []
+    equivalence_key = build_resource_equivalence_key(title, remarks)
+    if equivalence_key:
+        dedupe_keys.append(equivalence_key)
+
+    domain = resource_domain_label(api_base)
+    source_parts = [config.display_name, domain]
     if type_name:
         source_parts.append(type_name)
 
     return {
         "key": key,
-        "type": "ffzy",
-        "label": f"FFZY {type_name or type_id}",
+        "dedupe_keys": dedupe_keys,
+        "type": config.code,
+        "label": f"{config.display_name} {type_name or type_id}",
         "title": title,
         "subtitle": remarks,
         "code": type_name or type_id,
         "aired": updated_at or "未知",
         "time_label": "更新时间",
         "source": " · ".join(source_parts),
-        "url": ffzy_detail_api_url(api_base, vod_id),
+        "url": resource_detail_api_url(api_base, vod_id),
     }
 
 
@@ -919,19 +1036,137 @@ def clean_ffzy_key_part(value: Any) -> str:
     return re.sub(r"[^0-9A-Za-z_.:-]+", "_", text).strip("_") or "unknown"
 
 
-def ffzy_detail_api_url(api_base: str, vod_id: str) -> str:
+def item_state_keys(item: Dict[str, Any]) -> List[str]:
+    keys = [safe_text(item.get("key"), "")]
+    extra_keys = item.get("dedupe_keys") or []
+    if isinstance(extra_keys, (list, tuple, set)):
+        keys.extend(safe_text(key, "") for key in extra_keys)
+
+    return dedupe_keep_order([key for key in keys if key])
+
+
+def item_seen(item: Dict[str, Any], seen: set) -> bool:
+    return any(key in seen for key in item_state_keys(item))
+
+
+def remember_item(item: Dict[str, Any], seen: set, target: Optional[List[str]] = None) -> None:
+    for key in item_state_keys(item):
+        seen.add(key)
+        if target is not None:
+            target.append(key)
+
+
+def add_baseline_items(
+    items: Sequence[Dict[str, Any]],
+    pushed_set: set,
+    baseline_seen: set,
+    baseline_ids: List[str],
+) -> int:
+    item_count = 0
+    for item in items:
+        item_added = False
+        for key in item_state_keys(item):
+            if key in pushed_set or key in baseline_seen:
+                continue
+            baseline_seen.add(key)
+            baseline_ids.append(key)
+            item_added = True
+        if item_added:
+            item_count += 1
+    return item_count
+
+
+def sort_resource_site_items(items: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    return sorted(items, key=resource_site_sort_key)
+
+
+def resource_site_sort_key(item: Dict[str, Any]) -> Tuple[datetime, str, str]:
+    item_time = parse_ffzy_datetime(safe_text(item.get("aired"), ""))
+    return (
+        item_time or datetime.max,
+        safe_text(item.get("title"), ""),
+        safe_text(item.get("key"), ""),
+    )
+
+
+def build_resource_equivalence_key(title: str, remarks: str) -> str:
+    normalized_title = normalize_resource_equivalence_text(title)
+    episode_marker = normalize_resource_episode_marker(remarks)
+    if not normalized_title or not episode_marker:
+        return ""
+    return f"resource:{normalized_title}:{episode_marker}"
+
+
+def normalize_resource_equivalence_text(value: str) -> str:
+    text = unicodedata.normalize("NFKC", clean_ffzy_text(value, ""))
+    text = text.lower()
+    text = re.sub(r"\s+", "", text)
+    return re.sub(r"[^\w\u4e00-\u9fff]+", "", text)
+
+
+def normalize_resource_episode_marker(value: str) -> str:
+    text = unicodedata.normalize("NFKC", clean_ffzy_text(value, ""))
+    text = text.lower().replace("話", "话").replace("集数", "集")
+    match = re.search(r"(?:第)?([0-9]+)\s*[集话話期]", text)
+    if match:
+        return f"ep{int(match.group(1))}"
+
+    cn_match = re.search(r"(?:第)?([零〇一二两三四五六七八九十百千]+)\s*[集话話期]", text)
+    if cn_match:
+        number = parse_chinese_episode_number(cn_match.group(1))
+        if number is not None:
+            return f"ep{number}"
+
+    date_match = re.search(r"(20[0-9]{6})", text)
+    if date_match:
+        return f"date{date_match.group(1)}"
+
+    compact = normalize_resource_equivalence_text(text)
+    if compact in {"完结", "全集", "全"}:
+        return compact
+    return ""
+
+
+def parse_chinese_episode_number(value: str) -> Optional[int]:
+    digits = {"零": 0, "〇": 0, "一": 1, "二": 2, "两": 2, "三": 3, "四": 4, "五": 5, "六": 6, "七": 7, "八": 8, "九": 9}
+    units = {"十": 10, "百": 100, "千": 1000}
+
+    if not value:
+        return None
+    if all(char in digits for char in value):
+        return int("".join(str(digits[char]) for char in value))
+
+    total = 0
+    section = 0
+    for char in value:
+        if char in digits:
+            section = digits[char]
+            continue
+        unit = units.get(char)
+        if unit is None:
+            return None
+        if section == 0:
+            section = 1
+        total += section * unit
+        section = 0
+
+    total += section
+    return total if total > 0 else None
+
+
+def resource_detail_api_url(api_base: str, vod_id: str) -> str:
     if not vod_id:
         return ""
     return f"{api_base}?ac=detail&ids={vod_id}"
 
 
-def ffzy_domain_label(api_base: str) -> str:
+def resource_domain_label(api_base: str) -> str:
     parsed = urlparse(api_base)
     return parsed.netloc or api_base
 
 
-def is_recent_ffzy_time(value: str) -> bool:
-    if FFZY_MAX_AGE_HOURS <= 0 or not value or value == "未知":
+def is_recent_resource_site_time(value: str, max_age_hours: int) -> bool:
+    if max_age_hours <= 0 or not value or value == "未知":
         return True
 
     item_time = parse_ffzy_datetime(value)
@@ -940,7 +1175,7 @@ def is_recent_ffzy_time(value: str) -> bool:
 
     cn_tz = timezone(timedelta(hours=8))
     now = datetime.now(cn_tz).replace(tzinfo=None)
-    return now - timedelta(hours=FFZY_MAX_AGE_HOURS) <= item_time <= now + timedelta(hours=2)
+    return now - timedelta(hours=max_age_hours) <= item_time <= now + timedelta(hours=2)
 
 
 def parse_ffzy_datetime(value: str) -> Optional[datetime]:
@@ -1365,6 +1600,7 @@ def main() -> int:
         calendar_items = fetch_today_items(tokens)
         justwatch_items = fetch_justwatch_items()
         ffzy_items = fetch_ffzy_items()
+        bfzy_items = fetch_bfzy_items()
 
         baseline_ids: List[str] = []
         if justwatch_items and JUSTWATCH_BOOTSTRAP_ONLY and not any(
@@ -1384,37 +1620,40 @@ def main() -> int:
         else:
             calendar_items.extend(justwatch_items)
 
-        if ffzy_items and FFZY_BOOTSTRAP_ONLY and not any(
-            item.startswith("ffzy:") for item in pushed_ids
-        ):
-            ffzy_baseline_count = 0
-            for item in ffzy_items:
-                item_key = item["key"]
-                if item_key in pushed_set:
-                    continue
-                baseline_ids.append(item_key)
-                pushed_set.add(item_key)
-                ffzy_baseline_count += 1
+        baseline_seen = set()
+        resource_site_batches = [
+            (ffzy_site_config(), ffzy_items),
+            (bfzy_site_config(), bfzy_items),
+        ]
+        resource_candidates: List[Dict[str, Any]] = []
+        for config, items in resource_site_batches:
+            if not items:
+                continue
 
-            logging.info(
-                "FFZY 首次运行已建立 %s 条基线记录，本次不推送这些历史条目。",
-                ffzy_baseline_count,
-            )
-        else:
-            calendar_items.extend(ffzy_items)
+            has_existing_state = any(item.startswith(f"{config.code}:") for item in pushed_ids)
+            if config.bootstrap_only and not has_existing_state:
+                baseline_count = add_baseline_items(items, pushed_set, baseline_seen, baseline_ids)
+                logging.info(
+                    "%s 首次运行已建立 %s 条基线记录，本次不推送这些历史条目。",
+                    config.display_name,
+                    baseline_count,
+                )
+                continue
+
+            resource_candidates.extend(items)
+
+        calendar_items.extend(sort_resource_site_items(resource_candidates))
 
         new_items = []
         new_ids = []
         seen_this_run = set()
 
         for item in calendar_items:
-            item_key = item["key"]
-            if item_key in pushed_set or item_key in seen_this_run:
+            if item_seen(item, pushed_set) or item_seen(item, seen_this_run):
                 continue
 
             new_items.append(item)
-            new_ids.append(item_key)
-            seen_this_run.add(item_key)
+            remember_item(item, seen_this_run, new_ids)
 
         if not new_items:
             if baseline_ids:
