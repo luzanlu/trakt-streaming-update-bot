@@ -66,13 +66,16 @@ JUSTWATCH_GRAPHQL_URL = "https://apis.justwatch.com/graphql"
 JUSTWATCH_GRAPHQL_QUERY = """
 query GetNewTitles(
   $country: Country!
+  $date: Date
   $filter: TitleFilter!
   $first: Int!
+  $language: Language!
   $pageType: NewPageType!
   $priceDrops: Boolean!
 ) {
   newTitles(
     country: $country
+    date: $date
     filter: $filter
     first: $first
     pageType: $pageType
@@ -94,18 +97,52 @@ query GetNewTitles(
         __typename
         id
         objectType
-        content(country: $country, language: "zh") {
+        content(country: $country, language: $language) {
           title
           fullPath
         }
         ... on Season {
           show {
-            content(country: $country, language: "zh") {
+            content(country: $country, language: $language) {
               title
               fullPath
             }
           }
         }
+      }
+    }
+  }
+}
+"""
+JUSTWATCH_BUCKETS_GRAPHQL_QUERY = """
+query GetNewTitleBuckets(
+  $country: Country!
+  $filter: TitleFilter!
+  $first: Int!
+  $pageType: NewPageType!
+  $priceDrops: Boolean!
+) {
+  newTitleBuckets(
+    country: $country
+    filter: $filter
+    first: $first
+    bucketSize: 0
+    groupBy: DATE_PACKAGE
+    pageType: $pageType
+    priceDrops: $priceDrops
+  ) {
+    edges {
+      key {
+        ... on DatePackageAggregationKey {
+          date
+          package {
+            clearName
+            shortName
+          }
+        }
+      }
+      node {
+        totalCount
       }
     }
   }
@@ -514,7 +551,27 @@ def fetch_justwatch_items() -> List[Dict[str, str]]:
     return deduped
 
 
-def fetch_justwatch_provider_items(provider: str) -> List[Dict[str, str]]:
+def justwatch_empty_filter(packages: Optional[Sequence[str]] = None) -> Dict[str, Any]:
+    return {
+        "ageCertifications": [],
+        "excludeGenres": [],
+        "excludeIrrelevantTitles": False,
+        "excludeProductionCountries": [],
+        "genres": [],
+        "monetizationTypes": [],
+        "objectTypes": [],
+        "packages": list(packages or []),
+        "presentationTypes": [],
+        "productionCountries": [],
+        "subgenres": [],
+    }
+
+
+def fetch_justwatch_provider_items(
+    provider: str,
+    date: Optional[str] = None,
+    first: Optional[int] = None,
+) -> List[Dict[str, str]]:
     parts = provider.split(":", 1)
     if len(parts) != 2 or not parts[0].strip() or not parts[1].strip():
         raise RuntimeError("JUSTWATCH_PROVIDERS 条目格式必须是 COUNTRY:provider_code，例如 TW:lin")
@@ -523,20 +580,10 @@ def fetch_justwatch_provider_items(provider: str) -> List[Dict[str, str]]:
     provider_code = parts[1].strip()
     variables = {
         "country": country,
-        "filter": {
-            "ageCertifications": [],
-            "excludeGenres": [],
-            "excludeIrrelevantTitles": False,
-            "excludeProductionCountries": [],
-            "genres": [],
-            "monetizationTypes": [],
-            "objectTypes": [],
-            "packages": [provider_code],
-            "presentationTypes": [],
-            "productionCountries": [],
-            "subgenres": [],
-        },
-        "first": min(JUSTWATCH_ITEMS_PER_PROVIDER, 50),
+        "date": date,
+        "filter": justwatch_empty_filter([provider_code]),
+        "first": min(first or JUSTWATCH_ITEMS_PER_PROVIDER, 50),
+        "language": justwatch_language(country),
         "pageType": "NEW",
         "priceDrops": False,
     }
@@ -578,7 +625,73 @@ def fetch_justwatch_provider_items(provider: str) -> List[Dict[str, str]]:
     return items
 
 
+def fetch_justwatch_country_items(country: str) -> List[Dict[str, str]]:
+    country = country.strip().upper()
+    if not country:
+        raise RuntimeError("JustWatch 国家代码为空")
+
+    headers = {
+        "Accept": "application/json",
+        "Content-Type": "application/json",
+        "User-Agent": JUSTWATCH_USER_AGENT,
+    }
+    variables = {
+        "country": country,
+        "filter": justwatch_empty_filter(),
+        "first": min(JUSTWATCH_MAX_ITEMS, 20),
+        "pageType": "NEW",
+        "priceDrops": False,
+    }
+
+    try:
+        response = requests.post(
+            JUSTWATCH_GRAPHQL_URL,
+            json={"query": JUSTWATCH_BUCKETS_GRAPHQL_QUERY, "variables": variables},
+            headers=headers,
+            timeout=REQUEST_TIMEOUT,
+        )
+    except requests.RequestException as exc:
+        raise RuntimeError(f"请求 JustWatch GraphQL buckets 失败：{exc}") from exc
+
+    if response.status_code >= 400:
+        raise RuntimeError(
+            f"JustWatch GraphQL buckets 返回错误：HTTP {response.status_code} - {response.text[:300]}"
+        )
+
+    try:
+        data = response.json()
+    except ValueError as exc:
+        raise RuntimeError(f"JustWatch GraphQL buckets 响应不是合法 JSON：{exc}") from exc
+
+    if data.get("errors"):
+        raise RuntimeError(f"JustWatch GraphQL buckets 返回错误：{str(data['errors'])[:500]}")
+
+    items: List[Dict[str, str]] = []
+    for edge in (((data.get("data") or {}).get("newTitleBuckets") or {}).get("edges") or []):
+        key = edge.get("key") or {}
+        date = safe_text(key.get("date"), "")
+        package = key.get("package") or {}
+        provider_code = safe_text(package.get("shortName"), "")
+        total_count = edge.get("node", {}).get("totalCount") if isinstance(edge.get("node"), dict) else None
+
+        if not provider_code or not is_recent_justwatch_date(date):
+            continue
+
+        provider_first = JUSTWATCH_ITEMS_PER_PROVIDER
+        if isinstance(total_count, int) and total_count > 0:
+            provider_first = min(provider_first, total_count)
+
+        items.extend(fetch_justwatch_provider_items(f"{country}:{provider_code}", date=date, first=provider_first))
+        if len(items) >= JUSTWATCH_MAX_ITEMS:
+            break
+
+    return items[:JUSTWATCH_MAX_ITEMS]
+
+
 def fetch_justwatch_page_items(url: str) -> List[Dict[str, str]]:
+    if is_justwatch_country_new_url(url):
+        return fetch_justwatch_country_items(justwatch_country_from_url(url))
+
     headers = {
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
         "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.6",
@@ -778,6 +891,19 @@ def justwatch_country_from_url(url: str) -> str:
     if not path_parts:
         return ""
     return path_parts[0].upper()
+
+
+def is_justwatch_country_new_url(url: str) -> bool:
+    path_parts = [part for part in unquote(urlparse(url).path).split("/") if part]
+    if len(path_parts) < 2:
+        return False
+    return path_parts[1].lower() in {"new", "最新"}
+
+
+def justwatch_language(country: str) -> str:
+    if country.upper() in {"HK", "TW"}:
+        return "zh"
+    return "en"
 
 
 def extract_justwatch_query_date(query_key: str) -> str:
