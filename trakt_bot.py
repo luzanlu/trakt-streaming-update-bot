@@ -1,15 +1,39 @@
 import json
 import logging
 import os
+import re
 import shutil
 import subprocess
 import sys
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence
+from urllib.parse import unquote, urljoin, urlparse
 
 import requests
+
+
+def parse_bool_env(name: str, default: bool = False) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+def parse_int_env(name: str, default: int) -> int:
+    raw = os.getenv(name, "").strip()
+    if not raw:
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        logging.warning("环境变量 %s=%r 不是整数，将使用默认值 %s。", name, raw, default)
+        return default
+
+
+def split_env_list(raw: str) -> List[str]:
+    return [item.strip() for item in re.split(r"[\n,]+", raw or "") if item.strip()]
 
 
 TRAKT_API_VERSION = "2"
@@ -18,6 +42,76 @@ TRAKT_REDIRECT_URI = os.getenv("TRAKT_REDIRECT_URI", "urn:ietf:wg:oauth:2.0:oob"
 REQUEST_TIMEOUT = 20
 MAX_STATE_RECORDS = 500
 
+DEFAULT_JUSTWATCH_PROVIDERS = [
+    # JustWatch 没有公开的中国大陆区域；默认用港台区的主流中文平台。
+    "TW:iqi",  # iQIYI
+    "TW:tcv",  # WeTV
+    "TW:lin",  # LINE TV
+    "HK:iqi",  # iQIYI
+    "HK:tcv",  # WeTV
+    "HK:viu",  # Viu
+]
+JUSTWATCH_ENABLED = parse_bool_env("JUSTWATCH_ENABLED", False)
+JUSTWATCH_PROVIDERS = split_env_list(os.getenv("JUSTWATCH_PROVIDERS", "")) or DEFAULT_JUSTWATCH_PROVIDERS
+JUSTWATCH_URLS = split_env_list(os.getenv("JUSTWATCH_URLS", ""))
+JUSTWATCH_BOOTSTRAP_ONLY = parse_bool_env("JUSTWATCH_BOOTSTRAP_ONLY", True)
+JUSTWATCH_ITEMS_PER_PROVIDER = max(1, parse_int_env("JUSTWATCH_ITEMS_PER_PROVIDER", 10))
+JUSTWATCH_MAX_ITEMS = max(1, parse_int_env("JUSTWATCH_MAX_ITEMS", 100))
+JUSTWATCH_MAX_AGE_DAYS = max(0, parse_int_env("JUSTWATCH_MAX_AGE_DAYS", 14))
+JUSTWATCH_USER_AGENT = os.getenv(
+    "JUSTWATCH_USER_AGENT",
+    "Mozilla/5.0 (compatible; trakt-streaming-update-bot/1.0)",
+).strip()
+JUSTWATCH_GRAPHQL_URL = "https://apis.justwatch.com/graphql"
+JUSTWATCH_GRAPHQL_QUERY = """
+query GetNewTitles(
+  $country: Country!
+  $filter: TitleFilter!
+  $first: Int!
+  $pageType: NewPageType!
+  $priceDrops: Boolean!
+) {
+  newTitles(
+    country: $country
+    filter: $filter
+    first: $first
+    pageType: $pageType
+    priceDrops: $priceDrops
+  ) {
+    totalCount
+    edges {
+      cursor
+      newOffer(platform: WEB) {
+        id
+        dateCreated
+        newElementCount
+        package {
+          clearName
+          shortName
+        }
+      }
+      node {
+        __typename
+        id
+        objectType
+        content(country: $country, language: "zh") {
+          title
+          fullPath
+        }
+        ... on Season {
+          show {
+            content(country: $country, language: "zh") {
+              title
+              fullPath
+            }
+          }
+        }
+      }
+    }
+  }
+}
+"""
+
 BASE_DIR = Path(__file__).resolve().parent
 STATE_FILE = BASE_DIR / "pushed_episodes.json"
 
@@ -25,12 +119,7 @@ TRAKT_CLIENT_ID = os.getenv("TRAKT_CLIENT_ID", "").strip()
 TRAKT_CLIENT_SECRET = os.getenv("TRAKT_CLIENT_SECRET", "").strip()
 TRAKT_ACCESS_TOKEN = os.getenv("TRAKT_ACCESS_TOKEN", "").strip()
 TRAKT_REFRESH_TOKEN = os.getenv("TRAKT_REFRESH_TOKEN", "").strip()
-TRAKT_FORCE_REFRESH = os.getenv("TRAKT_FORCE_REFRESH", "").strip().lower() in {
-    "1",
-    "true",
-    "yes",
-    "y",
-}
+TRAKT_FORCE_REFRESH = parse_bool_env("TRAKT_FORCE_REFRESH", False)
 
 TG_BOT_TOKEN = os.getenv("TG_BOT_TOKEN", "").strip()
 TG_CHAT_ID = os.getenv("TG_CHAT_ID", "").strip()
@@ -385,6 +474,330 @@ def extract_movie(item: Dict[str, Any]) -> Optional[Dict[str, str]]:
     }
 
 
+def fetch_justwatch_items() -> List[Dict[str, str]]:
+    """抓取 JustWatch 最新上架页面，解析成统一推送条目。"""
+    if not JUSTWATCH_ENABLED:
+        return []
+
+    items: List[Dict[str, str]] = []
+    for provider in JUSTWATCH_PROVIDERS:
+        try:
+            provider_items = fetch_justwatch_provider_items(provider)
+        except Exception as exc:
+            logging.exception("查询 JustWatch 平台失败，本次跳过该平台：%s - %s", provider, exc)
+            continue
+
+        logging.info("JustWatch 平台 %s 解析到 %s 个最新条目。", provider, len(provider_items))
+        items.extend(provider_items)
+
+    for url in JUSTWATCH_URLS:
+        try:
+            page_items = fetch_justwatch_page_items(url)
+        except Exception as exc:
+            logging.exception("抓取 JustWatch 页面失败，本次跳过该页面：%s - %s", url, exc)
+            continue
+
+        logging.info("JustWatch 页面 %s 解析到 %s 个最新条目。", url, len(page_items))
+        items.extend(page_items)
+
+    deduped: List[Dict[str, str]] = []
+    seen = set()
+    for item in items:
+        key = item["key"]
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(item)
+        if len(deduped) >= JUSTWATCH_MAX_ITEMS:
+            break
+
+    return deduped
+
+
+def fetch_justwatch_provider_items(provider: str) -> List[Dict[str, str]]:
+    parts = provider.split(":", 1)
+    if len(parts) != 2 or not parts[0].strip() or not parts[1].strip():
+        raise RuntimeError("JUSTWATCH_PROVIDERS 条目格式必须是 COUNTRY:provider_code，例如 TW:lin")
+
+    country = parts[0].strip().upper()
+    provider_code = parts[1].strip()
+    variables = {
+        "country": country,
+        "filter": {
+            "ageCertifications": [],
+            "excludeGenres": [],
+            "excludeIrrelevantTitles": False,
+            "excludeProductionCountries": [],
+            "genres": [],
+            "monetizationTypes": [],
+            "objectTypes": [],
+            "packages": [provider_code],
+            "presentationTypes": [],
+            "productionCountries": [],
+            "subgenres": [],
+        },
+        "first": min(JUSTWATCH_ITEMS_PER_PROVIDER, 50),
+        "pageType": "NEW",
+        "priceDrops": False,
+    }
+    headers = {
+        "Accept": "application/json",
+        "Content-Type": "application/json",
+        "User-Agent": JUSTWATCH_USER_AGENT,
+    }
+
+    try:
+        response = requests.post(
+            JUSTWATCH_GRAPHQL_URL,
+            json={"query": JUSTWATCH_GRAPHQL_QUERY, "variables": variables},
+            headers=headers,
+            timeout=REQUEST_TIMEOUT,
+        )
+    except requests.RequestException as exc:
+        raise RuntimeError(f"请求 JustWatch GraphQL 失败：{exc}") from exc
+
+    if response.status_code >= 400:
+        raise RuntimeError(
+            f"JustWatch GraphQL 返回错误：HTTP {response.status_code} - {response.text[:300]}"
+        )
+
+    try:
+        data = response.json()
+    except ValueError as exc:
+        raise RuntimeError(f"JustWatch GraphQL 响应不是合法 JSON：{exc}") from exc
+
+    if data.get("errors"):
+        raise RuntimeError(f"JustWatch GraphQL 返回错误：{str(data['errors'])[:500]}")
+
+    connection = ((data.get("data") or {}).get("newTitles") or {})
+    items = []
+    for edge in connection.get("edges") or []:
+        item = extract_justwatch_edge(edge, country, "")
+        if item:
+            items.append(item)
+    return items
+
+
+def fetch_justwatch_page_items(url: str) -> List[Dict[str, str]]:
+    headers = {
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.6",
+        "User-Agent": JUSTWATCH_USER_AGENT,
+    }
+
+    try:
+        response = requests.get(url, headers=headers, timeout=REQUEST_TIMEOUT)
+    except requests.RequestException as exc:
+        raise RuntimeError(f"请求 JustWatch 失败：{exc}") from exc
+
+    if response.status_code >= 400:
+        raise RuntimeError(f"JustWatch 返回错误：HTTP {response.status_code} - {response.text[:300]}")
+
+    apollo_state = extract_justwatch_apollo_state(response.text)
+    root_query = resolve_apollo_value(apollo_state, apollo_state.get("ROOT_QUERY", {}))
+    country = justwatch_country_from_url(response.url or url)
+
+    items: List[Dict[str, str]] = []
+    for query_key, connection in root_query.items():
+        if not query_key.startswith("newTitles(") or '"pageType":"NEW"' not in query_key:
+            continue
+
+        query_date = extract_justwatch_query_date(query_key)
+        for edge in connection.get("edges") or []:
+            item = extract_justwatch_edge(edge, country, query_date)
+            if item:
+                items.append(item)
+
+    return items
+
+
+def extract_justwatch_apollo_state(html: str) -> Dict[str, Any]:
+    match = re.search(
+        r'<script type="application/json" data-nuxt-data="nuxt-app"[^>]*>(.*?)</script>',
+        html,
+        re.S,
+    )
+    if not match:
+        raise RuntimeError("JustWatch 页面中未找到 Nuxt 数据")
+
+    try:
+        payload = json.loads(match.group(1))
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"JustWatch Nuxt 数据不是合法 JSON：{exc}") from exc
+
+    cache: Dict[int, Any] = {}
+
+    def revive_index(index: int) -> Any:
+        if index in cache:
+            return cache[index]
+
+        value = payload[index]
+        if isinstance(value, dict):
+            revived = {
+                key: revive_index(item) if isinstance(item, int) else revive_list(item)
+                for key, item in value.items()
+            }
+        elif isinstance(value, list):
+            revived = revive_list(value)
+        else:
+            revived = value
+
+        cache[index] = revived
+        return revived
+
+    def revive_list(values: List[Any]) -> Any:
+        if (
+            values
+            and isinstance(values[0], str)
+            and values[0] in {"ShallowReactive", "Reactive", "Ref", "ShallowRef"}
+            and len(values) >= 2
+            and isinstance(values[1], int)
+        ):
+            return revive_index(values[1])
+
+        return [
+            revive_index(item)
+            if isinstance(item, int)
+            else revive_list(item)
+            if isinstance(item, list)
+            else item
+            for item in values
+        ]
+
+    try:
+        data = revive_index(4)
+    except (IndexError, TypeError) as exc:
+        raise RuntimeError("JustWatch Nuxt 数据结构异常") from exc
+
+    if not isinstance(data, dict) or "ROOT_QUERY" not in data:
+        raise RuntimeError("JustWatch Apollo 缓存结构异常")
+
+    return data
+
+
+def resolve_apollo_value(apollo_state: Dict[str, Any], value: Any, seen: Optional[set] = None) -> Any:
+    if seen is None:
+        seen = set()
+
+    if isinstance(value, dict):
+        if set(value.keys()) == {"__ref"}:
+            ref = value["__ref"]
+            if ref in seen:
+                return value
+            return resolve_apollo_value(apollo_state, apollo_state.get(ref, value), seen | {ref})
+
+        return {key: resolve_apollo_value(apollo_state, item, seen) for key, item in value.items()}
+
+    if isinstance(value, list):
+        return [resolve_apollo_value(apollo_state, item, seen) for item in value]
+
+    return value
+
+
+def extract_justwatch_edge(
+    edge: Dict[str, Any],
+    country: str,
+    query_date: str,
+) -> Optional[Dict[str, str]]:
+    node = edge.get("node") or {}
+    offer = edge.get("newOffer") or find_prefixed_value(edge, "newOffer(") or {}
+    if not offer:
+        return None
+
+    content = node.get("content") or find_prefixed_value(node, "content(") or {}
+    show = node.get("show") or {}
+    show_content = {}
+    if isinstance(show, dict):
+        show_content = show.get("content") or find_prefixed_value(show, "content(") or {}
+
+    object_type = safe_text(node.get("objectType") or node.get("__typename"), "")
+    package = offer.get("package") or {}
+    package_name = safe_text(package.get("clearName"), "")
+    package_code = safe_text(package.get("shortName"), "")
+    date_created = safe_text(offer.get("dateCreated") or query_date, "未知")
+    if not is_recent_justwatch_date(date_created):
+        return None
+
+    is_show = object_type in {"SHOW", "SHOW_SEASON", "EPISODE"}
+    title = safe_text(show_content.get("title") if is_show else content.get("title"), "")
+    if not title:
+        title = safe_text(content.get("title") or show_content.get("title"), "")
+    if not title:
+        return None
+
+    full_path = safe_text(show_content.get("fullPath") or content.get("fullPath"), "")
+    url = urljoin("https://www.justwatch.com", full_path) if full_path else ""
+
+    source_parts = ["JustWatch"]
+    if country:
+        source_parts.append(country)
+    if package_name:
+        source_parts.append(package_name)
+    source = " · ".join(source_parts)
+
+    subtitle_parts = []
+    season_title = safe_text(content.get("title"), "")
+    if is_show and season_title and season_title != title:
+        subtitle_parts.append(season_title)
+
+    new_count = offer.get("newElementCount")
+    if isinstance(new_count, int) and new_count > 0:
+        subtitle_parts.append(f"新增 {new_count} 集")
+
+    offer_id = safe_text(offer.get("id"), "")
+    node_id = safe_text(node.get("id"), "")
+    key_id = offer_id or f"{country}:{package_code}:{node_id}:{date_created}"
+    key = f"justwatch:{key_id}"
+
+    return {
+        "key": key,
+        "type": "justwatch_show" if is_show else "justwatch_movie",
+        "label": "JustWatch剧集" if is_show else "JustWatch电影",
+        "title": title,
+        "subtitle": "，".join(subtitle_parts),
+        "code": package_name or "JustWatch",
+        "aired": date_created,
+        "time_label": "上架日期",
+        "source": source,
+        "url": url,
+    }
+
+
+def find_prefixed_value(data: Dict[str, Any], prefix: str) -> Any:
+    if not isinstance(data, dict):
+        return None
+
+    for key, value in data.items():
+        if key.startswith(prefix):
+            return value
+    return None
+
+
+def justwatch_country_from_url(url: str) -> str:
+    path_parts = [part for part in unquote(urlparse(url).path).split("/") if part]
+    if not path_parts:
+        return ""
+    return path_parts[0].upper()
+
+
+def extract_justwatch_query_date(query_key: str) -> str:
+    match = re.search(r'"date":"([^"]+)"', query_key)
+    return match.group(1) if match else ""
+
+
+def is_recent_justwatch_date(value: str) -> bool:
+    if JUSTWATCH_MAX_AGE_DAYS <= 0 or not value or value == "未知":
+        return True
+
+    try:
+        item_date = datetime.strptime(value, "%Y-%m-%d").date()
+    except ValueError:
+        return True
+
+    today = datetime.now(timezone.utc).date()
+    return today - timedelta(days=JUSTWATCH_MAX_AGE_DAYS) <= item_date <= today + timedelta(days=1)
+
+
 def safe_text(value: Any, fallback: str) -> str:
     if value is None:
         return fallback
@@ -415,12 +828,18 @@ def build_discord_message(items: Sequence[Dict[str, str]]) -> str:
         lines.append(f"**[{item['label']}] {item['title']}**")
         if item["type"] == "episode":
             lines.append(f"- `{item['code']}` {item['subtitle']}")
+        elif item.get("subtitle"):
+            lines.append(f"- {item['subtitle']}")
+        if item.get("source"):
+            lines.append(f"- 来源：{item['source']}")
         lines.extend(
             [
-                f"- 上线时间：{item['aired']}",
+                f"- {item.get('time_label', '上线时间')}：{item['aired']}",
                 "",
             ]
         )
+        if item.get("url"):
+            lines.insert(-1, f"- 链接：{item['url']}")
     return "\n".join(lines).strip()
 
 
@@ -444,18 +863,25 @@ def build_telegram_message(items: Sequence[Dict[str, str]]) -> str:
         label = escape_markdown_v2(item["label"])
         title = escape_markdown_v2(item["title"])
         aired = escape_markdown_v2(item["aired"])
+        time_label = escape_markdown_v2(item.get("time_label", "上线时间"))
 
         lines.append(f"*\\[{label}\\] {title}*")
         if item["type"] == "episode":
             code = escape_markdown_v2(item["code"])
             subtitle = escape_markdown_v2(item["subtitle"])
             lines.append(f"• `{code}` {subtitle}")
+        elif item.get("subtitle"):
+            lines.append(f"• {escape_markdown_v2(item['subtitle'])}")
+        if item.get("source"):
+            lines.append(f"• 来源：{escape_markdown_v2(item['source'])}")
         lines.extend(
             [
-                f"• 上线时间：{aired}",
+                f"• {time_label}：{aired}",
                 "",
             ]
         )
+        if item.get("url"):
+            lines.insert(-1, f"• 链接：{escape_markdown_v2(item['url'])}")
     return "\n".join(lines).strip()
 
 
@@ -570,6 +996,25 @@ def main() -> int:
         pushed_set = set(pushed_ids)
 
         calendar_items = fetch_today_items(tokens)
+        justwatch_items = fetch_justwatch_items()
+
+        baseline_ids: List[str] = []
+        if justwatch_items and JUSTWATCH_BOOTSTRAP_ONLY and not any(
+            item.startswith("justwatch:") for item in pushed_ids
+        ):
+            for item in justwatch_items:
+                item_key = item["key"]
+                if item_key in pushed_set:
+                    continue
+                baseline_ids.append(item_key)
+                pushed_set.add(item_key)
+
+            logging.info(
+                "JustWatch 首次运行已建立 %s 条基线记录，本次不推送这些历史条目。",
+                len(baseline_ids),
+            )
+        else:
+            calendar_items.extend(justwatch_items)
 
         new_items = []
         new_ids = []
@@ -585,6 +1030,9 @@ def main() -> int:
             seen_this_run.add(item_key)
 
         if not new_items:
+            if baseline_ids:
+                save_pushed_ids(pushed_ids + baseline_ids)
+                logging.info("已更新 pushed_episodes.json，新增 %s 条 JustWatch 基线记录。", len(baseline_ids))
             logging.info("没有发现需要推送的新剧集或电影。")
             return 0
 
@@ -598,8 +1046,8 @@ def main() -> int:
             logging.error("至少一个推送渠道失败，本次不更新 pushed_episodes.json。")
             return 1
 
-        save_pushed_ids(pushed_ids + new_ids)
-        logging.info("已更新 pushed_episodes.json，新增 %s 条记录。", len(new_ids))
+        save_pushed_ids(pushed_ids + baseline_ids + new_ids)
+        logging.info("已更新 pushed_episodes.json，新增 %s 条记录。", len(baseline_ids) + len(new_ids))
         return 0
 
     except Exception as exc:

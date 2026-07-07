@@ -41,6 +41,13 @@ jobs:
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
           GH_SECRET_WRITE_TOKEN: ${{ secrets.GH_SECRET_WRITE_TOKEN }}
+          JUSTWATCH_ENABLED: ${{ vars.JUSTWATCH_ENABLED || 'true' }}
+          JUSTWATCH_PROVIDERS: ${{ vars.JUSTWATCH_PROVIDERS }}
+          JUSTWATCH_URLS: ${{ vars.JUSTWATCH_URLS }}
+          JUSTWATCH_BOOTSTRAP_ONLY: ${{ vars.JUSTWATCH_BOOTSTRAP_ONLY || 'true' }}
+          JUSTWATCH_ITEMS_PER_PROVIDER: ${{ vars.JUSTWATCH_ITEMS_PER_PROVIDER || '10' }}
+          JUSTWATCH_MAX_ITEMS: ${{ vars.JUSTWATCH_MAX_ITEMS || '100' }}
+          JUSTWATCH_MAX_AGE_DAYS: ${{ vars.JUSTWATCH_MAX_AGE_DAYS || '14' }}
         run: python trakt_bot.py
 
       - name: Commit pushed episode state
