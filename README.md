@@ -2,7 +2,7 @@
 
 GitHub Actions 每小时运行一次，读取 Trakt.tv 个人剧集和电影日历，并推送新上架内容到 Telegram 或 Discord。
 
-脚本也支持 JustWatch 最新上架追踪。JustWatch 没有公开的中国大陆区域，默认追踪港台区的 iQIYI、WeTV、LINE TV 和 Viu。
+脚本也支持 JustWatch 最新上架追踪。JustWatch 没有公开的中国大陆区域，默认追踪台湾 JustWatch 最新上架页。
 
 ## GitHub Secrets
 
@@ -55,8 +55,8 @@ GitHub Actions 默认启用 JustWatch。首次启用时，脚本会把当前 Jus
 可以在仓库 Settings -> Secrets and variables -> Actions -> Variables 中调整：
 
 - `JUSTWATCH_ENABLED`：是否启用，默认 `true`
-- `JUSTWATCH_PROVIDERS`：要追踪的平台，多个值用逗号或换行分隔，格式为 `COUNTRY:provider_code`；默认 `TW:iqi,TW:tcv,TW:lin,HK:iqi,HK:tcv,HK:viu`
-- `JUSTWATCH_URLS`：额外要追踪的 JustWatch 最新页，多个 URL 用逗号或换行分隔；通常留空即可
+- `JUSTWATCH_PROVIDERS`：要额外追踪的平台，多个值用逗号或换行分隔，格式为 `COUNTRY:provider_code`；默认留空
+- `JUSTWATCH_URLS`：要追踪的 JustWatch 最新页，多个 URL 用逗号或换行分隔；默认 `https://www.justwatch.com/tw/%E6%9C%80%E6%96%B0`
 - `JUSTWATCH_BOOTSTRAP_ONLY`：首次启用是否只建立基线，默认 `true`
 - `JUSTWATCH_ITEMS_PER_PROVIDER`：每个平台每次最多取多少个 JustWatch 条目，默认 `10`
 - `JUSTWATCH_MAX_ITEMS`：每次最多处理多少个 JustWatch 条目，默认 `100`

@@ -42,18 +42,14 @@ TRAKT_REDIRECT_URI = os.getenv("TRAKT_REDIRECT_URI", "urn:ietf:wg:oauth:2.0:oob"
 REQUEST_TIMEOUT = 20
 MAX_STATE_RECORDS = 500
 
-DEFAULT_JUSTWATCH_PROVIDERS = [
-    # JustWatch 没有公开的中国大陆区域；默认用港台区的主流中文平台。
-    "TW:iqi",  # iQIYI
-    "TW:tcv",  # WeTV
-    "TW:lin",  # LINE TV
-    "HK:iqi",  # iQIYI
-    "HK:tcv",  # WeTV
-    "HK:viu",  # Viu
+DEFAULT_JUSTWATCH_PROVIDERS: List[str] = []
+DEFAULT_JUSTWATCH_URLS = [
+    # JustWatch 没有公开的中国大陆区域；默认追踪台湾最新上架页。
+    "https://www.justwatch.com/tw/%E6%9C%80%E6%96%B0",
 ]
 JUSTWATCH_ENABLED = parse_bool_env("JUSTWATCH_ENABLED", False)
 JUSTWATCH_PROVIDERS = split_env_list(os.getenv("JUSTWATCH_PROVIDERS", "")) or DEFAULT_JUSTWATCH_PROVIDERS
-JUSTWATCH_URLS = split_env_list(os.getenv("JUSTWATCH_URLS", ""))
+JUSTWATCH_URLS = split_env_list(os.getenv("JUSTWATCH_URLS", "")) or DEFAULT_JUSTWATCH_URLS
 JUSTWATCH_BOOTSTRAP_ONLY = parse_bool_env("JUSTWATCH_BOOTSTRAP_ONLY", True)
 JUSTWATCH_ITEMS_PER_PROVIDER = max(1, parse_int_env("JUSTWATCH_ITEMS_PER_PROVIDER", 10))
 JUSTWATCH_MAX_ITEMS = max(1, parse_int_env("JUSTWATCH_MAX_ITEMS", 100))
