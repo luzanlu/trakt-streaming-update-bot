@@ -50,6 +50,43 @@ GitHub Actions 每 30 分钟运行一次，读取 Trakt.tv 个人剧集和电影
 
 去重状态保存在 `pushed_episodes.json`，每次成功推送后由 GitHub Actions 自动提交回仓库。新记录会使用 `episode:ID` 和 `movie:ID` 区分类型；资源站还会额外写入 `resource:剧名:集数` 形式的跨站去重键，用来避免 FFZY/BFZY 重复推送同一集。
 
+## 订阅配置文件
+
+仓库内的 `bot_config.json` 用来控制订阅范围。GitHub Actions Variables 里显式填写的同名环境变量优先级更高；变量留空时会使用这个配置文件。
+
+常用开关：
+
+- `trakt.shows` / `trakt.movies`：是否推送 Trakt 剧集、电影。
+- `justwatch.country`：JustWatch 国家/地区，默认 `TW`。
+- `justwatch.media_types`：JustWatch 推送类型，可填 `show`、`movie`。
+- `ffzy.categories` / `bfzy.categories`：资源站分类名，可填 `国产剧`、`香港剧`、`韩国剧`、`欧美剧`、`国产动漫`、`日韩动漫`、`欧美动漫`。
+
+例如只要台湾 JustWatch 剧集、Trakt 剧集，以及 FFZY/BFZY 国产动漫，可以这样改：
+
+```json
+{
+  "trakt": {
+    "enabled": true,
+    "shows": true,
+    "movies": false
+  },
+  "justwatch": {
+    "enabled": true,
+    "country": "TW",
+    "language": "zh",
+    "media_types": ["show"]
+  },
+  "ffzy": {
+    "enabled": true,
+    "categories": ["国产动漫"]
+  },
+  "bfzy": {
+    "enabled": true,
+    "categories": ["国产动漫"]
+  }
+}
+```
+
 ## JustWatch 追踪
 
 GitHub Actions 默认启用 JustWatch。首次启用时，脚本会把当前 JustWatch 页面内容写入基线状态，但不会把这些历史条目一次性推送出去；后续页面出现新上架条目才会推送。
@@ -57,8 +94,11 @@ GitHub Actions 默认启用 JustWatch。首次启用时，脚本会把当前 Jus
 可以在仓库 Settings -> Secrets and variables -> Actions -> Variables 中调整：
 
 - `JUSTWATCH_ENABLED`：是否启用，默认 `true`
+- `JUSTWATCH_COUNTRY`：JustWatch 国家/地区，默认 `TW`
+- `JUSTWATCH_LANGUAGE`：JustWatch 内容语言，默认 `zh`
+- `JUSTWATCH_MEDIA_TYPES`：推送类型，多个值用逗号或换行分隔，例如 `show,movie`
 - `JUSTWATCH_PROVIDERS`：要额外追踪的平台，多个值用逗号或换行分隔，格式为 `COUNTRY:provider_code`；默认留空
-- `JUSTWATCH_URLS`：要追踪的 JustWatch 最新页，多个 URL 用逗号或换行分隔；默认 `https://www.justwatch.com/tw/%E6%9C%80%E6%96%B0`
+- `JUSTWATCH_URLS`：要追踪的 JustWatch 最新页，多个 URL 用逗号或换行分隔；默认按 `JUSTWATCH_COUNTRY` 生成对应地区最新页
 - `JUSTWATCH_BOOTSTRAP_ONLY`：首次启用是否只建立基线，默认 `true`
 - `JUSTWATCH_ITEMS_PER_PROVIDER`：每个平台每次最多取多少个 JustWatch 条目，默认 `10`
 - `JUSTWATCH_MAX_ITEMS`：每次最多处理多少个 JustWatch 条目，默认 `100`
@@ -86,6 +126,7 @@ GitHub Actions 默认启用 FFZY。首次启用时，脚本会把当前 FFZY 最
 - `FFZY_ENABLED`：是否启用，默认 `true`
 - `FFZY_DOMAINS`：备用域名列表，多个值用逗号或换行分隔，默认 `ffzy1.tv,ffzy2.tv,ffzy3.tv,ffzy4.tv,ffzy5.tv`
 - `FFZY_BOOTSTRAP_ONLY`：首次启用是否只建立基线，默认 `true`
+- `FFZY_CATEGORIES`：要追踪的分类名，多个值用逗号或换行分隔，例如 `国产剧,国产动漫`
 - `FFZY_TYPE_IDS`：要追踪的分类 ID，多个值用逗号或换行分隔，默认 `13,14,15,16,29,30,31`
 - `FFZY_ITEMS_PER_TYPE`：每个分类每次最多处理多少条，默认 `20`
 - `FFZY_PAGES_PER_TYPE`：每个分类每次最多请求多少页，默认 `1`
@@ -114,6 +155,7 @@ GitHub Actions 默认启用 BFZY。首次启用时，脚本会把当前 BFZY 最
 - `BFZY_ENABLED`：是否启用，默认 `true`
 - `BFZY_DOMAINS`：备用域名列表，多个值用逗号或换行分隔，默认 `bfzyapi.com,bfzy.tv`
 - `BFZY_BOOTSTRAP_ONLY`：首次启用是否只建立基线，默认 `true`
+- `BFZY_CATEGORIES`：要追踪的分类名，多个值用逗号或换行分隔，例如 `国产剧,国产动漫`
 - `BFZY_TYPE_IDS`：要追踪的分类 ID，多个值用逗号或换行分隔，默认 `31,33,34,32,40,41,42`
 - `BFZY_ITEMS_PER_TYPE`：每个分类每次最多处理多少条，默认 `20`
 - `BFZY_PAGES_PER_TYPE`：每个分类每次最多请求多少页，默认 `1`

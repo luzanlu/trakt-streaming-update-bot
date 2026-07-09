@@ -1,3 +1,5 @@
+import base64
+import binascii
 import html
 import json
 import logging
@@ -38,24 +40,196 @@ def split_env_list(raw: str) -> List[str]:
     return [item.strip() for item in re.split(r"[\n,]+", raw or "") if item.strip()]
 
 
+BASE_DIR = Path(__file__).resolve().parent
+CONFIG_FILE = BASE_DIR / "bot_config.json"
+
+
+def load_bot_config() -> Dict[str, Any]:
+    raw_path = os.getenv("BOT_CONFIG_FILE", "").strip()
+    config_file = Path(raw_path) if raw_path else CONFIG_FILE
+    if not config_file.is_absolute():
+        config_file = BASE_DIR / config_file
+
+    if not config_file.exists():
+        return {}
+
+    try:
+        raw = json.loads(config_file.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"{config_file.name} 不是合法 JSON：{exc}") from exc
+    except OSError as exc:
+        raise RuntimeError(f"读取 {config_file.name} 失败：{exc}") from exc
+
+    if not isinstance(raw, dict):
+        raise RuntimeError(f"{config_file.name} 顶层结构必须是对象")
+    return raw
+
+
+BOT_CONFIG = load_bot_config()
+MISSING_CONFIG_VALUE = object()
+
+
+def config_section(name: str) -> Dict[str, Any]:
+    section = BOT_CONFIG.get(name, {})
+    return section if isinstance(section, dict) else {}
+
+
+def config_value(section_name: str, key: str) -> Any:
+    section = config_section(section_name)
+    if key not in section:
+        return MISSING_CONFIG_VALUE
+    return section[key]
+
+
+def env_override(name: str) -> Optional[str]:
+    raw = os.getenv(name)
+    if raw is None:
+        return None
+    raw = raw.strip()
+    return raw if raw else None
+
+
+def parse_bool_value(value: Any, default: bool) -> bool:
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return default
+    return str(value).strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+def config_bool(section_name: str, key: str, env_name: str, default: bool) -> bool:
+    raw_env = env_override(env_name)
+    if raw_env is not None:
+        return parse_bool_value(raw_env, default)
+
+    value = config_value(section_name, key)
+    if value is MISSING_CONFIG_VALUE:
+        return default
+    return parse_bool_value(value, default)
+
+
+def config_int(section_name: str, key: str, env_name: str, default: int) -> int:
+    raw_env = env_override(env_name)
+    value = raw_env if raw_env is not None else config_value(section_name, key)
+    if value is MISSING_CONFIG_VALUE or value is None or str(value).strip() == "":
+        return default
+
+    try:
+        return int(str(value).strip())
+    except ValueError:
+        logging.warning("配置 %s.%s=%r 不是整数，将使用默认值 %s。", section_name, key, value, default)
+        return default
+
+
+def config_str(section_name: str, key: str, env_name: str, default: str) -> str:
+    raw_env = env_override(env_name)
+    value = raw_env if raw_env is not None else config_value(section_name, key)
+    if value is MISSING_CONFIG_VALUE or value is None:
+        return default
+    text = str(value).strip()
+    return text if text else default
+
+
+def coerce_config_list(value: Any) -> List[str]:
+    if value is None:
+        return []
+    if isinstance(value, str):
+        return split_env_list(value)
+    if isinstance(value, (list, tuple, set)):
+        return [str(item).strip() for item in value if str(item).strip()]
+    return [str(value).strip()] if str(value).strip() else []
+
+
+def config_list(
+    section_name: str,
+    key: str,
+    env_name: str,
+    default: Sequence[str],
+) -> List[str]:
+    raw_env = env_override(env_name)
+    if raw_env is not None:
+        return split_env_list(raw_env)
+
+    value = config_value(section_name, key)
+    if value is MISSING_CONFIG_VALUE:
+        return list(default)
+    return coerce_config_list(value)
+
+
+def config_list_optional(section_name: str, key: str, env_name: str) -> Optional[List[str]]:
+    raw_env = env_override(env_name)
+    if raw_env is not None:
+        return split_env_list(raw_env)
+
+    value = config_value(section_name, key)
+    if value is MISSING_CONFIG_VALUE:
+        return None
+    return coerce_config_list(value)
+
+
+def unique_keep_order(values: Sequence[str]) -> List[str]:
+    seen = set()
+    result = []
+    for value in values:
+        if value in seen:
+            continue
+        seen.add(value)
+        result.append(value)
+    return result
+
+
+def normalize_justwatch_country(value: str) -> str:
+    country = str(value or "").strip().upper()
+    if not re.fullmatch(r"[A-Z]{2}", country):
+        logging.warning("JustWatch 国家代码 %r 无效，将使用 TW。", value)
+        return "TW"
+    return country
+
+
+def justwatch_country_new_url(country: str) -> str:
+    return f"https://www.justwatch.com/{normalize_justwatch_country(country).lower()}/new"
+
+
+def normalize_config_token(value: str) -> str:
+    return re.sub(r"[\s_\-]+", "", str(value).strip().lower())
+
+
+TRAKT_ENABLED = config_bool("trakt", "enabled", "TRAKT_ENABLED", True)
+TRAKT_SHOWS_ENABLED = config_bool("trakt", "shows", "TRAKT_SHOWS_ENABLED", True)
+TRAKT_MOVIES_ENABLED = config_bool("trakt", "movies", "TRAKT_MOVIES_ENABLED", True)
 TRAKT_API_VERSION = "2"
 TRAKT_CALENDAR_DAYS = 1
 TRAKT_REDIRECT_URI = os.getenv("TRAKT_REDIRECT_URI", "urn:ietf:wg:oauth:2.0:oob").strip()
 REQUEST_TIMEOUT = 20
 MAX_STATE_RECORDS = 5000
 
+DEFAULT_JUSTWATCH_COUNTRY = "TW"
 DEFAULT_JUSTWATCH_PROVIDERS: List[str] = []
-DEFAULT_JUSTWATCH_URLS = [
-    # JustWatch 没有公开的中国大陆区域；默认追踪台湾最新上架页。
-    "https://www.justwatch.com/tw/%E6%9C%80%E6%96%B0",
-]
-JUSTWATCH_ENABLED = parse_bool_env("JUSTWATCH_ENABLED", False)
-JUSTWATCH_PROVIDERS = split_env_list(os.getenv("JUSTWATCH_PROVIDERS", "")) or DEFAULT_JUSTWATCH_PROVIDERS
-JUSTWATCH_URLS = split_env_list(os.getenv("JUSTWATCH_URLS", "")) or DEFAULT_JUSTWATCH_URLS
-JUSTWATCH_BOOTSTRAP_ONLY = parse_bool_env("JUSTWATCH_BOOTSTRAP_ONLY", True)
-JUSTWATCH_ITEMS_PER_PROVIDER = max(1, parse_int_env("JUSTWATCH_ITEMS_PER_PROVIDER", 10))
-JUSTWATCH_MAX_ITEMS = max(1, parse_int_env("JUSTWATCH_MAX_ITEMS", 100))
-JUSTWATCH_MAX_AGE_DAYS = max(0, parse_int_env("JUSTWATCH_MAX_AGE_DAYS", 14))
+JUSTWATCH_ENABLED = config_bool("justwatch", "enabled", "JUSTWATCH_ENABLED", False)
+JUSTWATCH_COUNTRY = normalize_justwatch_country(
+    config_str("justwatch", "country", "JUSTWATCH_COUNTRY", DEFAULT_JUSTWATCH_COUNTRY)
+)
+JUSTWATCH_LANGUAGE = config_str("justwatch", "language", "JUSTWATCH_LANGUAGE", "zh")
+JUSTWATCH_MEDIA_TYPES = unique_keep_order(
+    normalize_config_token(item)
+    for item in config_list("justwatch", "media_types", "JUSTWATCH_MEDIA_TYPES", ["show", "movie"])
+)
+JUSTWATCH_PROVIDERS = config_list(
+    "justwatch",
+    "providers",
+    "JUSTWATCH_PROVIDERS",
+    DEFAULT_JUSTWATCH_PROVIDERS,
+)
+configured_justwatch_urls = config_list_optional("justwatch", "urls", "JUSTWATCH_URLS")
+JUSTWATCH_URLS = (
+    configured_justwatch_urls
+    if configured_justwatch_urls is not None
+    else [justwatch_country_new_url(JUSTWATCH_COUNTRY)]
+)
+JUSTWATCH_BOOTSTRAP_ONLY = config_bool("justwatch", "bootstrap_only", "JUSTWATCH_BOOTSTRAP_ONLY", True)
+JUSTWATCH_ITEMS_PER_PROVIDER = max(1, config_int("justwatch", "items_per_provider", "JUSTWATCH_ITEMS_PER_PROVIDER", 10))
+JUSTWATCH_MAX_ITEMS = max(1, config_int("justwatch", "max_items", "JUSTWATCH_MAX_ITEMS", 100))
+JUSTWATCH_MAX_AGE_DAYS = max(0, config_int("justwatch", "max_age_days", "JUSTWATCH_MAX_AGE_DAYS", 14))
 JUSTWATCH_USER_AGENT = os.getenv(
     "JUSTWATCH_USER_AGENT",
     "Mozilla/5.0 (compatible; trakt-streaming-update-bot/1.0)",
@@ -122,15 +296,9 @@ DEFAULT_FFZY_DOMAINS = [
 ]
 DEFAULT_FFZY_TYPE_IDS = ["13", "14", "15", "16", "29", "30", "31"]
 DEFAULT_FFZY_TYPE_NAMES = ["国产剧", "香港剧", "韩国剧", "欧美剧", "国产动漫", "日韩动漫", "欧美动漫"]
-FFZY_ENABLED = parse_bool_env("FFZY_ENABLED", False)
-FFZY_DOMAINS = split_env_list(os.getenv("FFZY_DOMAINS", "")) or DEFAULT_FFZY_DOMAINS
-FFZY_TYPE_IDS = split_env_list(os.getenv("FFZY_TYPE_IDS", "")) or DEFAULT_FFZY_TYPE_IDS
-FFZY_BOOTSTRAP_ONLY = parse_bool_env("FFZY_BOOTSTRAP_ONLY", True)
-FFZY_ITEMS_PER_TYPE = max(1, parse_int_env("FFZY_ITEMS_PER_TYPE", 20))
-FFZY_PAGES_PER_TYPE = max(1, parse_int_env("FFZY_PAGES_PER_TYPE", 1))
-FFZY_MAX_ITEMS = max(1, parse_int_env("FFZY_MAX_ITEMS", 200))
-FFZY_MAX_AGE_HOURS = max(0, parse_int_env("FFZY_MAX_AGE_HOURS", 168))
-FFZY_REQUEST_TIMEOUT = max(1, parse_int_env("FFZY_REQUEST_TIMEOUT", 8))
+FFZY_CATEGORY_IDS = dict(zip(DEFAULT_FFZY_TYPE_NAMES, DEFAULT_FFZY_TYPE_IDS))
+FFZY_ENABLED = config_bool("ffzy", "enabled", "FFZY_ENABLED", False)
+FFZY_DOMAINS = config_list("ffzy", "domains", "FFZY_DOMAINS", DEFAULT_FFZY_DOMAINS)
 FFZY_USER_AGENT = os.getenv(
     "FFZY_USER_AGENT",
     "Mozilla/5.0 (compatible; trakt-streaming-update-bot/1.0)",
@@ -150,19 +318,88 @@ DEFAULT_BFZY_TYPE_NAMES = [
     "日韩动漫",
     "欧美动漫",
 ]
-BFZY_ENABLED = parse_bool_env("BFZY_ENABLED", False)
-BFZY_DOMAINS = split_env_list(os.getenv("BFZY_DOMAINS", "")) or DEFAULT_BFZY_DOMAINS
-BFZY_TYPE_IDS = split_env_list(os.getenv("BFZY_TYPE_IDS", "")) or DEFAULT_BFZY_TYPE_IDS
-BFZY_BOOTSTRAP_ONLY = parse_bool_env("BFZY_BOOTSTRAP_ONLY", True)
-BFZY_ITEMS_PER_TYPE = max(1, parse_int_env("BFZY_ITEMS_PER_TYPE", 20))
-BFZY_PAGES_PER_TYPE = max(1, parse_int_env("BFZY_PAGES_PER_TYPE", 1))
-BFZY_MAX_ITEMS = max(1, parse_int_env("BFZY_MAX_ITEMS", 200))
-BFZY_MAX_AGE_HOURS = max(0, parse_int_env("BFZY_MAX_AGE_HOURS", 168))
-BFZY_REQUEST_TIMEOUT = max(1, parse_int_env("BFZY_REQUEST_TIMEOUT", 8))
+BFZY_CATEGORY_IDS = dict(zip(DEFAULT_BFZY_TYPE_NAMES, DEFAULT_BFZY_TYPE_IDS))
+BFZY_ENABLED = config_bool("bfzy", "enabled", "BFZY_ENABLED", False)
+BFZY_DOMAINS = config_list("bfzy", "domains", "BFZY_DOMAINS", DEFAULT_BFZY_DOMAINS)
 BFZY_USER_AGENT = os.getenv(
     "BFZY_USER_AGENT",
     "Mozilla/5.0 (compatible; trakt-streaming-update-bot/1.0)",
 ).strip()
+
+
+def resolve_resource_type_config(
+    section_name: str,
+    env_name: str,
+    default_ids: Sequence[str],
+    category_ids: Dict[str, str],
+) -> Tuple[List[str], List[str]]:
+    env_ids = env_override(env_name)
+    if env_ids is not None:
+        type_ids = split_env_list(env_ids)
+        return type_ids, resource_type_names_for_ids(type_ids, category_ids)
+
+    configured_type_ids = config_value(section_name, "type_ids")
+    if configured_type_ids is not MISSING_CONFIG_VALUE:
+        type_ids = coerce_config_list(configured_type_ids)
+        return type_ids, resource_type_names_for_ids(type_ids, category_ids)
+
+    env_categories = env_override(f"{section_name.upper()}_CATEGORIES")
+    configured_categories = (
+        split_env_list(env_categories)
+        if env_categories is not None
+        else config_value(section_name, "categories")
+    )
+    if configured_categories is MISSING_CONFIG_VALUE:
+        type_ids = list(default_ids)
+        return type_ids, resource_type_names_for_ids(type_ids, category_ids)
+
+    category_lookup = {normalize_config_token(name): type_id for name, type_id in category_ids.items()}
+    selected_ids = []
+    for category in coerce_config_list(configured_categories):
+        category = category.strip()
+        if re.fullmatch(r"\d+", category):
+            selected_ids.append(category)
+            continue
+        type_id = category_lookup.get(normalize_config_token(category))
+        if not type_id:
+            logging.warning("%s.categories 包含未知分类 %r，将跳过。", section_name, category)
+            continue
+        selected_ids.append(type_id)
+
+    type_ids = unique_keep_order(selected_ids)
+    return type_ids, resource_type_names_for_ids(type_ids, category_ids)
+
+
+def resource_type_names_for_ids(type_ids: Sequence[str], category_ids: Dict[str, str]) -> List[str]:
+    id_to_name = {type_id: name for name, type_id in category_ids.items()}
+    return [id_to_name[type_id] for type_id in type_ids if type_id in id_to_name]
+
+
+FFZY_TYPE_IDS, FFZY_TYPE_NAMES = resolve_resource_type_config(
+    "ffzy",
+    "FFZY_TYPE_IDS",
+    DEFAULT_FFZY_TYPE_IDS,
+    FFZY_CATEGORY_IDS,
+)
+FFZY_BOOTSTRAP_ONLY = config_bool("ffzy", "bootstrap_only", "FFZY_BOOTSTRAP_ONLY", True)
+FFZY_ITEMS_PER_TYPE = max(1, config_int("ffzy", "items_per_type", "FFZY_ITEMS_PER_TYPE", 20))
+FFZY_PAGES_PER_TYPE = max(1, config_int("ffzy", "pages_per_type", "FFZY_PAGES_PER_TYPE", 1))
+FFZY_MAX_ITEMS = max(1, config_int("ffzy", "max_items", "FFZY_MAX_ITEMS", 200))
+FFZY_MAX_AGE_HOURS = max(0, config_int("ffzy", "max_age_hours", "FFZY_MAX_AGE_HOURS", 168))
+FFZY_REQUEST_TIMEOUT = max(1, config_int("ffzy", "request_timeout", "FFZY_REQUEST_TIMEOUT", 8))
+
+BFZY_TYPE_IDS, BFZY_TYPE_NAMES = resolve_resource_type_config(
+    "bfzy",
+    "BFZY_TYPE_IDS",
+    DEFAULT_BFZY_TYPE_IDS,
+    BFZY_CATEGORY_IDS,
+)
+BFZY_BOOTSTRAP_ONLY = config_bool("bfzy", "bootstrap_only", "BFZY_BOOTSTRAP_ONLY", True)
+BFZY_ITEMS_PER_TYPE = max(1, config_int("bfzy", "items_per_type", "BFZY_ITEMS_PER_TYPE", 20))
+BFZY_PAGES_PER_TYPE = max(1, config_int("bfzy", "pages_per_type", "BFZY_PAGES_PER_TYPE", 1))
+BFZY_MAX_ITEMS = max(1, config_int("bfzy", "max_items", "BFZY_MAX_ITEMS", 200))
+BFZY_MAX_AGE_HOURS = max(0, config_int("bfzy", "max_age_hours", "BFZY_MAX_AGE_HOURS", 168))
+BFZY_REQUEST_TIMEOUT = max(1, config_int("bfzy", "request_timeout", "BFZY_REQUEST_TIMEOUT", 8))
 JUSTWATCH_BUCKETS_GRAPHQL_QUERY = """
 query GetNewTitleBuckets(
   $country: Country!
@@ -198,7 +435,6 @@ query GetNewTitleBuckets(
 }
 """
 
-BASE_DIR = Path(__file__).resolve().parent
 STATE_FILE = BASE_DIR / "pushed_episodes.json"
 
 TRAKT_CLIENT_ID = os.getenv("TRAKT_CLIENT_ID", "").strip()
@@ -251,12 +487,12 @@ class ResourceSiteConfig:
 def require_config() -> None:
     """校验必要配置，避免运行时静默失败。"""
     missing = []
-    if not TRAKT_CLIENT_ID:
+    if TRAKT_ENABLED and not TRAKT_CLIENT_ID:
         missing.append("TRAKT_CLIENT_ID")
 
     has_access_token = bool(TRAKT_ACCESS_TOKEN)
     has_refresh_credentials = bool(TRAKT_CLIENT_SECRET and TRAKT_REFRESH_TOKEN)
-    if not has_access_token and not has_refresh_credentials:
+    if TRAKT_ENABLED and not has_access_token and not has_refresh_credentials:
         missing.append("TRAKT_ACCESS_TOKEN 或 TRAKT_CLIENT_SECRET + TRAKT_REFRESH_TOKEN")
 
     if missing:
@@ -497,23 +733,28 @@ def fetch_calendar(tokens: TraktTokens, media_type: str) -> List[Dict[str, Any]]
 
 def fetch_today_items(tokens: TraktTokens) -> List[Dict[str, str]]:
     """获取今天的剧集和电影，并解析成统一的推送条目。"""
+    if not TRAKT_ENABLED:
+        return []
+
     if TRAKT_FORCE_REFRESH or not tokens.access_token:
         logging.info("开始刷新 Trakt token。")
         refresh_trakt_token(tokens)
 
     items = []
-    show_entries = fetch_calendar(tokens, "shows")
-    movie_entries = fetch_calendar(tokens, "movies")
 
-    for entry in show_entries:
-        item = extract_episode(entry)
-        if item:
-            items.append(item)
+    if TRAKT_SHOWS_ENABLED:
+        show_entries = fetch_calendar(tokens, "shows")
+        for entry in show_entries:
+            item = extract_episode(entry)
+            if item:
+                items.append(item)
 
-    for entry in movie_entries:
-        item = extract_movie(entry)
-        if item:
-            items.append(item)
+    if TRAKT_MOVIES_ENABLED:
+        movie_entries = fetch_calendar(tokens, "movies")
+        for entry in movie_entries:
+            item = extract_movie(entry)
+            if item:
+                items.append(item)
 
     return items
 
@@ -606,6 +847,8 @@ def fetch_justwatch_items() -> List[Dict[str, str]]:
     deduped: List[Dict[str, str]] = []
     seen = set()
     for item in items:
+        if not justwatch_item_allowed(item):
+            continue
         key = item["key"]
         if key in seen:
             continue
@@ -615,6 +858,21 @@ def fetch_justwatch_items() -> List[Dict[str, str]]:
             break
 
     return deduped
+
+
+def justwatch_item_allowed(item: Dict[str, str]) -> bool:
+    item_country = safe_text(item.get("country"), "").upper()
+    if item_country and item_country != JUSTWATCH_COUNTRY:
+        return False
+
+    media_type = "show" if item.get("type") == "justwatch_show" else "movie"
+    if not JUSTWATCH_MEDIA_TYPES:
+        return True
+
+    allowed = set(JUSTWATCH_MEDIA_TYPES)
+    if media_type == "show":
+        return bool(allowed & {"show", "shows", "tv", "tvshow", "tvshows", "series", "剧集", "电视剧"})
+    return bool(allowed & {"movie", "movies", "film", "films", "motionpicture", "电影"})
 
 
 def justwatch_empty_filter(packages: Optional[Sequence[str]] = None) -> Dict[str, Any]:
@@ -639,11 +897,15 @@ def fetch_justwatch_provider_items(
     first: Optional[int] = None,
 ) -> List[Dict[str, str]]:
     parts = provider.split(":", 1)
-    if len(parts) != 2 or not parts[0].strip() or not parts[1].strip():
-        raise RuntimeError("JUSTWATCH_PROVIDERS 条目格式必须是 COUNTRY:provider_code，例如 TW:lin")
+    if len(parts) == 1 and parts[0].strip():
+        country = JUSTWATCH_COUNTRY
+        provider_code = parts[0].strip()
+    elif len(parts) == 2 and parts[0].strip() and parts[1].strip():
+        country = normalize_justwatch_country(parts[0])
+        provider_code = parts[1].strip()
+    else:
+        raise RuntimeError("JUSTWATCH_PROVIDERS 条目格式必须是 provider_code 或 COUNTRY:provider_code，例如 lin 或 TW:lin")
 
-    country = parts[0].strip().upper()
-    provider_code = parts[1].strip()
     variables = {
         "country": country,
         "date": date,
@@ -692,7 +954,7 @@ def fetch_justwatch_provider_items(
 
 
 def fetch_justwatch_country_items(country: str) -> List[Dict[str, str]]:
-    country = country.strip().upper()
+    country = normalize_justwatch_country(country)
     if not country:
         raise RuntimeError("JustWatch 国家代码为空")
 
@@ -756,7 +1018,7 @@ def fetch_justwatch_country_items(country: str) -> List[Dict[str, str]]:
 
 def fetch_justwatch_page_items(url: str) -> List[Dict[str, str]]:
     if is_justwatch_country_new_url(url):
-        return fetch_justwatch_country_items(justwatch_country_from_url(url))
+        return fetch_justwatch_country_items(JUSTWATCH_COUNTRY)
 
     headers = {
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
@@ -774,7 +1036,7 @@ def fetch_justwatch_page_items(url: str) -> List[Dict[str, str]]:
 
     apollo_state = extract_justwatch_apollo_state(response.text)
     root_query = resolve_apollo_value(apollo_state, apollo_state.get("ROOT_QUERY", {}))
-    country = justwatch_country_from_url(response.url or url)
+    country = normalize_justwatch_country(justwatch_country_from_url(response.url or url) or JUSTWATCH_COUNTRY)
 
     items: List[Dict[str, str]] = []
     for query_key, connection in root_query.items():
@@ -797,7 +1059,7 @@ def ffzy_site_config() -> ResourceSiteConfig:
         enabled=FFZY_ENABLED,
         domains=list(FFZY_DOMAINS),
         type_ids=list(FFZY_TYPE_IDS),
-        type_names=list(DEFAULT_FFZY_TYPE_NAMES),
+        type_names=list(FFZY_TYPE_NAMES),
         bootstrap_only=FFZY_BOOTSTRAP_ONLY,
         items_per_type=FFZY_ITEMS_PER_TYPE,
         pages_per_type=FFZY_PAGES_PER_TYPE,
@@ -815,7 +1077,7 @@ def bfzy_site_config() -> ResourceSiteConfig:
         enabled=BFZY_ENABLED,
         domains=list(BFZY_DOMAINS),
         type_ids=list(BFZY_TYPE_IDS),
-        type_names=list(DEFAULT_BFZY_TYPE_NAMES),
+        type_names=list(BFZY_TYPE_NAMES),
         bootstrap_only=BFZY_BOOTSTRAP_ONLY,
         items_per_type=BFZY_ITEMS_PER_TYPE,
         pages_per_type=BFZY_PAGES_PER_TYPE,
@@ -1349,6 +1611,7 @@ def extract_justwatch_edge(
         "time_label": "上架日期",
         "source": source,
         "url": url,
+        "country": country,
     }
 
 
@@ -1377,9 +1640,37 @@ def is_justwatch_country_new_url(url: str) -> bool:
 
 
 def justwatch_language(country: str) -> str:
-    if country.upper() in {"HK", "TW"}:
-        return "zh"
-    return "en"
+    return JUSTWATCH_LANGUAGE or ("zh" if country.upper() in {"HK", "TW"} else "en")
+
+
+def justwatch_state_country(key: str) -> str:
+    if not key.startswith("justwatch:"):
+        return ""
+
+    key_id = key.split(":", 1)[1]
+    candidates = [key_id]
+    try:
+        padded = key_id + ("=" * (-len(key_id) % 4))
+        candidates.append(base64.b64decode(padded).decode("utf-8", errors="ignore"))
+    except (binascii.Error, ValueError, TypeError):
+        pass
+
+    for candidate in candidates:
+        match = re.search(r"(?:^|[:|])([A-Z]{2})(?=[:|])", candidate)
+        if match:
+            return match.group(1)
+    return ""
+
+
+def has_justwatch_state_for_country(pushed_ids: Sequence[str], country: str) -> bool:
+    country = normalize_justwatch_country(country)
+    for key in pushed_ids:
+        if not key.startswith("justwatch:"):
+            continue
+        state_country = justwatch_state_country(key)
+        if state_country == country:
+            return True
+    return False
 
 
 def extract_justwatch_query_date(query_key: str) -> str:
@@ -1604,7 +1895,8 @@ def main() -> int:
 
         baseline_ids: List[str] = []
         if justwatch_items and JUSTWATCH_BOOTSTRAP_ONLY and not any(
-            item.startswith("justwatch:") for item in pushed_ids
+            has_justwatch_state_for_country(pushed_ids, safe_text(item.get("country"), JUSTWATCH_COUNTRY))
+            for item in justwatch_items
         ):
             for item in justwatch_items:
                 item_key = item["key"]

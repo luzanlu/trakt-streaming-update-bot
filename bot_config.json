@@ -1,0 +1,40 @@
+{
+  "trakt": {
+    "enabled": true,
+    "shows": true,
+    "movies": true
+  },
+  "justwatch": {
+    "enabled": true,
+    "country": "TW",
+    "language": "zh",
+    "media_types": ["show", "movie"],
+    "providers": [],
+    "bootstrap_only": true,
+    "items_per_provider": 10,
+    "max_items": 100,
+    "max_age_days": 14
+  },
+  "ffzy": {
+    "enabled": true,
+    "domains": ["ffzy1.tv", "ffzy2.tv", "ffzy3.tv", "ffzy4.tv", "ffzy5.tv"],
+    "categories": ["国产剧", "香港剧", "韩国剧", "欧美剧", "国产动漫", "日韩动漫", "欧美动漫"],
+    "bootstrap_only": true,
+    "items_per_type": 20,
+    "pages_per_type": 1,
+    "max_items": 200,
+    "max_age_hours": 168,
+    "request_timeout": 8
+  },
+  "bfzy": {
+    "enabled": true,
+    "domains": ["bfzyapi.com", "bfzy.tv"],
+    "categories": ["国产剧", "香港剧", "韩国剧", "欧美剧", "国产动漫", "日韩动漫", "欧美动漫"],
+    "bootstrap_only": true,
+    "items_per_type": 20,
+    "pages_per_type": 1,
+    "max_items": 200,
+    "max_age_hours": 168,
+    "request_timeout": 8
+  }
+}
