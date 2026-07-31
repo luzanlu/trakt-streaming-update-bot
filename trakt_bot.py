@@ -1892,7 +1892,14 @@ def main() -> int:
         pushed_ids = load_pushed_ids()
         pushed_set = set(pushed_ids)
 
-        calendar_items = fetch_today_items(tokens)
+        try:
+            calendar_items = fetch_today_items(tokens)
+        except Exception as exc:
+            # Trakt refresh tokens can be revoked independently of the other
+            # feeds. Keep the scheduled job healthy so JustWatch/FFZY/BFZY
+            # continue to run while the Trakt credentials are re-authorized.
+            logging.error("Trakt 获取失败，本次跳过 Trakt：%s", exc)
+            calendar_items = []
         justwatch_items = fetch_justwatch_items()
         ffzy_items = fetch_ffzy_items()
         bfzy_items = fetch_bfzy_items()
