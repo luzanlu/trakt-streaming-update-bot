@@ -721,10 +721,14 @@ def parse_calendar_response(response: requests.Response, media_type: str) -> Lis
 
 
 def fetch_calendar(tokens: TraktTokens, media_type: str) -> List[Dict[str, Any]]:
-    """调用 Trakt 个人日历接口，401 时自动刷新 token 并重试一次。"""
+    """调用 Trakt 个人日历接口，认证失败时刷新 token 并重试一次。"""
     response = request_calendar(tokens, media_type)
-    if response.status_code == 401 and can_refresh_trakt_token(tokens):
-        logging.warning("Trakt access_token 已失效，开始自动续期。")
+    if response.status_code in (401, 403) and can_refresh_trakt_token(tokens):
+        logging.warning(
+            "Trakt %s 日历返回 HTTP %s，开始刷新 access_token 并重试。",
+            media_type,
+            response.status_code,
+        )
         refresh_trakt_token(tokens)
         response = request_calendar(tokens, media_type)
 
