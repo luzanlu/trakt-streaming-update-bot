@@ -1,0 +1,39 @@
+name: MDL diag
+
+on:
+  workflow_dispatch:
+
+jobs:
+  diag:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+      - run: pip install -r requirements.txt
+      - name: Diag
+        env:
+          MYDRAMALIST_ENABLED: "true"
+          MYDRAMALIST_ONLY_AIRED: "true"
+          MYDRAMALIST_BOOTSTRAP_ONLY: "true"
+        run: |
+          python - <<'PY'
+          import re
+          from datetime import datetime, timezone
+          import trakt_bot as t
+
+          html = t.request_mydramalist_html(t.mydramalist_calendar_url())
+          days = re.findall(r'<div id="d\d+">\s*<small>\s*([^<]*?)\s*</small>', html)
+          now = datetime.now(timezone.utc)
+          print("NOW_UTC:", now.isoformat())
+          print("DAYS:", days)
+          print("CARDS:", html.count(t.MYDRAMALIST_CARD_MARKER))
+          items = t.parse_mydramalist_calendar(html)
+          print("ONLY_AIRED_ITEMS:", len(items))
+          print("TIMES:", sorted({i["aired"] for i in items})[:6])
+          t.MYDRAMALIST_ONLY_AIRED = False
+          all_items = t.parse_mydramalist_calendar(html)
+          print("ALL_ITEMS:", len(all_items))
+          print("TIME_SAMPLE:", sorted({i["aired"] for i in all_items})[:4])
+          PY
