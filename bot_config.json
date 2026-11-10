@@ -42,9 +42,12 @@
     "countries": ["South Korea"],
     "types": ["Drama"],
     "timezone": "Asia/Shanghai",
-    "only_aired": true,
+    "only_aired": false,
     "lookahead_hours": 0,
-    "bootstrap_only": true,
+    "bootstrap_only": false,
+    "remind_at_air": true,
+    "remind_window_minutes": 90,
+    "initial_push_days": 3,
     "max_items": 200,
     "request_timeout": 20
   }

@@ -167,23 +167,30 @@ GitHub Actions 默认启用 BFZY。首次启用时，脚本会把当前 BFZY 最
 
 ## MyDramaList 追踪
 
-GitHub Actions 默认启用 MyDramaList。脚本直接抓取剧集日历页（`/episode-calendar`），按卡片里的「日期 + 当地播出时间 + 时区」换算成 UTC，再和当前时间比较，默认只推送已经播出的集数，避免提前预告。
+MyDramaList 单独跑一个工作流 `.github/workflows/mydramalist.yml`，**每 5 分钟**抓一次剧集日历页（`/episode-calendar`），只跑这一个源；Trakt、JustWatch、FFZY、BFZY 仍由 `run.yml` 每 30 分钟跑，两边互不影响，通过同一个 concurrency 组排队，避免同时改状态文件。
 
-首次启用时，脚本会把当前页面上符合条件的条目写入基线状态，不会一次性推送历史条目；后续同一部剧的新集数才会推送。
+脚本按卡片里的「日期 + 当地播出时间 + 时区」换算成 UTC。每个条目会推送**两条**消息：
 
-去重键格式为 `mydramalist:{剧集ID}:ep{集数}`，电影为 `mydramalist:{剧集ID}:movie`。
+1. **预告卡片**：日历上一出现就推（默认包含未来 7 天内还没播的集数），图文形式，标「状态：待开播」；
+2. **开播提醒**：到了播出时间、且 90 分钟内还没提醒过，再推一条短消息「E8 已开播」，带「在 MyDramaList 查看」按钮。
+
+去重键格式：预告 `mydramalist:{剧集ID}:ep{集数}`，提醒 `mydramalist-alert:{剧集ID}:ep{集数}`，电影后缀换成 `movie`。首次启用默认**不建基线**，当前日历上的条目会全部推一遍。
+
+因为 5 分钟一轮，开播提醒的实际误差取决于 Actions 调度延迟，一般在 5～10 分钟内；GitHub 的定时任务不保证准点。
 
 Telegram 渠道会把 MyDramaList 条目发成**图文卡片**：封面图 + 剧名（可点击）、集数、播出时间、题材、评分、简介，并附「在 MyDramaList 查看」按钮，点一下直接进站点。图片由脚本先下载再上传，避免 Telegram 侧抓取被 Cloudflare 拦。图片下载或发送失败时会自动回退成文本摘要，不会漏推。其他来源（Trakt、JustWatch、FFZY、BFZY）仍合并成一条文本摘要，链接改为可点击的 MarkdownV2 内联链接。
 
 可以在仓库 Settings -> Secrets and variables -> Actions -> Variables 中调整：
 
-- `MYDRAMALIST_ENABLED`：是否启用，默认 `true`
+- `MYDRAMALIST_ENABLED`：是否启用，默认 `true`（`run.yml` 里默认已改为 `false`，这个源只在专属工作流里跑）
 - `MYDRAMALIST_COUNTRIES`：国家/地区，多个值用逗号或换行分隔，默认 `South Korea`；可选 `Japan`、`China`、`Hong Kong`、`Taiwan`、`Thailand`、`Philippines`、`Singapore`
 - `MYDRAMALIST_TYPES`：内容类型，多个值用逗号或换行分隔，默认 `Drama`；可选 `Movie`、`TV Show`、`Special`
 - `MYDRAMALIST_TIMEZONE`：页面时区参数，默认 `Asia/Shanghai`
-- `MYDRAMALIST_ONLY_AIRED`：是否只推送已播出的集数，默认 `true`；设为 `false` 会推送未来 7 天内的全部条目
+- `MYDRAMALIST_ONLY_AIRED`：是否只推送已播出的集数，默认 `false`；设为 `true` 就退回到「只推已播、不预告」
 - `MYDRAMALIST_LOOKAHEAD_HOURS`：提前多少小时把即将播出的条目也算作可推送，默认 `0`
-- `MYDRAMALIST_BOOTSTRAP_ONLY`：首次启用是否只建立基线，默认 `true`
+- `MYDRAMALIST_BOOTSTRAP_ONLY`：首次启用是否只建立基线，默认 `false`（当前日历上的条目全部推送）
+- `MYDRAMALIST_REMIND_AT_AIR`：是否在到点开播时补一条提醒，默认 `true`
+- `MYDRAMALIST_REMIND_WINDOW_MINUTES`：开播后多少分钟内补提醒，超过就不再补，默认 `90`
 - `MYDRAMALIST_MAX_ITEMS`：每次最多处理多少条，默认 `200`
 - `MYDRAMALIST_REQUEST_TIMEOUT`：请求超时时间，默认 `20` 秒
 

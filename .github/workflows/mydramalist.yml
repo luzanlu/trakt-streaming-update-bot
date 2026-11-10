@@ -1,0 +1,81 @@
+name: MyDramaList Watch
+
+# 只跑 MyDramaList 一个源，5 分钟一轮，用于「出现即推预告 + 到点推开播提醒」。
+# 其它源仍由 run.yml 每 30 分钟跑，互不影响。
+on:
+  schedule:
+    - cron: "*/5 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+# 与 run.yml 共用同一个并发组，避免两个工作流同时改 pushed_episodes.json。
+concurrency:
+  group: trakt-streaming-update-bot
+  cancel-in-progress: false
+
+jobs:
+  mydramalist:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Watch MyDramaList
+        env:
+          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          BOT_CONFIG_FILE: ${{ vars.BOT_CONFIG_FILE || 'bot_config.json' }}
+          TRAKT_ENABLED: "false"
+          MYDRAMALIST_ENABLED: "true"
+          MYDRAMALIST_COUNTRIES: ${{ vars.MYDRAMALIST_COUNTRIES }}
+          MYDRAMALIST_TYPES: ${{ vars.MYDRAMALIST_TYPES }}
+          MYDRAMALIST_TIMEZONE: ${{ vars.MYDRAMALIST_TIMEZONE || 'Asia/Shanghai' }}
+          MYDRAMALIST_ONLY_AIRED: ${{ vars.MYDRAMALIST_ONLY_AIRED || 'false' }}
+          MYDRAMALIST_BOOTSTRAP_ONLY: ${{ vars.MYDRAMALIST_BOOTSTRAP_ONLY || 'false' }}
+          MYDRAMALIST_REMIND_AT_AIR: ${{ vars.MYDRAMALIST_REMIND_AT_AIR || 'true' }}
+          MYDRAMALIST_REMIND_WINDOW_MINUTES: ${{ vars.MYDRAMALIST_REMIND_WINDOW_MINUTES || '90' }}
+          MYDRAMALIST_MAX_ITEMS: ${{ vars.MYDRAMALIST_MAX_ITEMS || '200' }}
+          MYDRAMALIST_REQUEST_TIMEOUT: ${{ vars.MYDRAMALIST_REQUEST_TIMEOUT || '20' }}
+          MYDRAMALIST_COOKIE: ${{ secrets.MYDRAMALIST_COOKIE }}
+        run: python trakt_bot.py --only mydramalist
+
+      - name: Commit pushed episode state
+        shell: bash
+        run: |
+          if [[ -z "$(git status --porcelain pushed_episodes.json)" ]]; then
+            echo "No pushed_episodes.json changes to commit."
+            exit 0
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add pushed_episodes.json
+          git commit -m "chore: update mydramalist state"
+
+          for attempt in 1 2 3; do
+            if git push; then
+              echo "State pushed on attempt ${attempt}."
+              exit 0
+            fi
+            # 主工作流可能刚提交过状态，先把远端变更拉回来再推。
+            git pull --rebase --autostash origin main || true
+            sleep $((attempt * 5))
+          done
+
+          echo "Failed to push pushed_episodes.json after 3 attempts."
+          exit 1

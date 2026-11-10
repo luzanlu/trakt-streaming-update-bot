@@ -1,2 +1,4 @@
-﻿requests>=2.32.0,<3
+requests>=2.32.0,<3
 curl-cffi>=0.7,<1
+# 部分环境（如 Windows / 精简镜像）没有系统时区库，缺了会把播出时间当 UTC 处理。
+tzdata>=2024.1

@@ -416,6 +416,14 @@ MYDRAMALIST_ONLY_AIRED = config_bool("mydramalist", "only_aired", "MYDRAMALIST_O
 MYDRAMALIST_LOOKAHEAD_HOURS = max(0, config_int("mydramalist", "lookahead_hours", "MYDRAMALIST_LOOKAHEAD_HOURS", 0))
 MYDRAMALIST_BOOTSTRAP_ONLY = config_bool("mydramalist", "bootstrap_only", "MYDRAMALIST_BOOTSTRAP_ONLY", True)
 MYDRAMALIST_MAX_ITEMS = max(1, config_int("mydramalist", "max_items", "MYDRAMALIST_MAX_ITEMS", 200))
+MYDRAMALIST_REMIND_AT_AIR = config_bool("mydramalist", "remind_at_air", "MYDRAMALIST_REMIND_AT_AIR", True)
+MYDRAMALIST_REMIND_WINDOW_MINUTES = max(
+    1, config_int("mydramalist", "remind_window_minutes", "MYDRAMALIST_REMIND_WINDOW_MINUTES", 90)
+)
+MYDRAMALIST_ALERT_KEY_PREFIX = "mydramalist-alert:"
+# 首次启用这个源时，只把最近几天到点的条目推出来，更远的先记账，避免一次刷几十条。
+MYDRAMALIST_INITIAL_PUSH_DAYS = max(0, config_int("mydramalist", "initial_push_days", "MYDRAMALIST_INITIAL_PUSH_DAYS", 3))
+MYDRAMALIST_INITIAL_MARKER = "mydramalist-initial-v2"
 MYDRAMALIST_REQUEST_TIMEOUT = max(1, config_int("mydramalist", "request_timeout", "MYDRAMALIST_REQUEST_TIMEOUT", 20))
 MYDRAMALIST_USER_AGENT = os.getenv(
     "MYDRAMALIST_USER_AGENT",
@@ -1245,6 +1253,11 @@ def extract_mydramalist_item(
     kind = "episode" if episode_number else "movie"
     key = f"mydramalist:{show_id}:ep{episode_number}" if episode_number else f"mydramalist:{show_id}:movie"
 
+    air_ts = int(aired_dt.timestamp()) if aired_dt is not None else 0
+    air_status = ""
+    if air_ts:
+        air_status = "已开播" if air_ts <= int(now.timestamp()) else "待开播"
+
     subtitle_parts = list(genres)
 
     source_parts = ["MyDramaList"]
@@ -1269,6 +1282,9 @@ def extract_mydramalist_item(
         "image": image,
         "score": score,
         "synopsis": clean_ffzy_text(synopsis, ""),
+        "air_ts": air_ts,
+        "air_status": air_status,
+        "remind_key": key.replace("mydramalist:", MYDRAMALIST_ALERT_KEY_PREFIX, 1),
     }
 
 
@@ -1283,6 +1299,10 @@ def mydramalist_zone(name: str):
     try:
         return ZoneInfo(name)
     except Exception:
+        # 缺 tzdata 时退回 UTC，会把播出时间整体偏移，日志里明确提示。
+        logging.warning(
+            "时区 %s 不可用（缺少 tzdata？），本次按 UTC 处理播出时间，可能偏移。", name or "UTC"
+        )
         return timezone.utc
 
 
@@ -2165,6 +2185,8 @@ def build_telegram_caption(item: Dict[str, Any]) -> str:
 
     if item.get("aired"):
         lines.append(f"播出：{telegram_html(item['aired'])}")
+    if item.get("air_status") == "待开播":
+        lines.append("状态：待开播")
     if item.get("subtitle"):
         lines.append(f"题材：{telegram_html(item['subtitle'])}")
     if item.get("score"):
@@ -2276,6 +2298,47 @@ def send_telegram(items: Sequence[Dict[str, str]]) -> bool:
     return True
 
 
+def send_telegram_alert(item: Dict[str, Any]) -> bool:
+    """开播到点提醒：一条短消息，标题可点，附「在 MyDramaList 查看」按钮。"""
+    if not (TG_BOT_TOKEN and TG_CHAT_ID):
+        return True
+
+    url = f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage"
+    title = telegram_html(item.get("title", ""))
+    link = telegram_html(item.get("url", ""))
+    head = f'🔔 <b><a href="{link}">{title}</a></b>' if link else f"🔔 <b>{title}</b>"
+    lines = [head, f"{telegram_html(item.get('code', ''))} 已开播"]
+    if item.get("aired"):
+        lines.append(f"播出：{telegram_html(item['aired'])}")
+
+    payload: Dict[str, Any] = {
+        "chat_id": TG_CHAT_ID,
+        "text": "\n".join(lines),
+        "parse_mode": "HTML",
+        "disable_web_page_preview": False,
+    }
+    if item.get("url"):
+        payload["reply_markup"] = json.dumps(
+            {"inline_keyboard": [[{"text": "在 MyDramaList 查看", "url": item["url"]}]]},
+            ensure_ascii=False,
+        )
+
+    try:
+        response = requests.post(url, json=payload, timeout=REQUEST_TIMEOUT)
+    except requests.RequestException as exc:
+        logging.error("发送开播提醒失败：%s", exc)
+        return False
+
+    if response.status_code >= 400:
+        logging.error(
+            "Telegram 开播提醒返回错误：HTTP %s - %s", response.status_code, response.text[:500]
+        )
+        return False
+
+    logging.info("开播提醒发送成功：%s %s", item.get("title"), item.get("code"))
+    return True
+
+
 def send_telegram_digest(items: Sequence[Dict[str, str]]) -> bool:
     url = f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage"
     message = build_telegram_message(items)
@@ -2340,9 +2403,14 @@ def send_discord(items: Sequence[Dict[str, str]]) -> bool:
     return True
 
 
-def main() -> int:
+def main(only_source: str = "") -> int:
     try:
         require_config()
+        only = (only_source or "").strip().lower()
+
+        def want(name: str) -> bool:
+            """--only 模式下只抓指定源；默认抓全部已启用源。"""
+            return only in ("", "all") or only == name
 
         tokens = TraktTokens(
             access_token=TRAKT_ACCESS_TOKEN,
@@ -2352,23 +2420,27 @@ def main() -> int:
         pushed_ids = load_pushed_ids()
         pushed_set = set(pushed_ids)
 
-        try:
-            calendar_items = fetch_today_items(tokens)
-        except Exception as exc:
-            # Trakt refresh tokens can be revoked independently of the other
-            # feeds. Keep the scheduled job healthy so JustWatch/FFZY/BFZY
-            # continue to run while the Trakt credentials are re-authorized.
-            logging.error("Trakt 获取失败，本次跳过 Trakt：%s", exc)
-            calendar_items = []
-        justwatch_items = fetch_justwatch_items()
-        ffzy_items = fetch_ffzy_items()
-        bfzy_items = fetch_bfzy_items()
-        try:
-            mydramalist_items = fetch_mydramalist_items()
-        except Exception as exc:
-            # MyDramaList 可能触发风控，失败时只跳过这个源，不影响其他渠道。
-            logging.error("MyDramaList 获取失败，本次跳过：%s", exc)
-            mydramalist_items = []
+        calendar_items: List[Dict[str, str]] = []
+        if want("trakt"):
+            try:
+                calendar_items = fetch_today_items(tokens)
+            except Exception as exc:
+                # Trakt refresh tokens can be revoked independently of the other
+                # feeds. Keep the scheduled job healthy so JustWatch/FFZY/BFZY
+                # continue to run while the Trakt credentials are re-authorized.
+                logging.error("Trakt 获取失败，本次跳过 Trakt：%s", exc)
+                calendar_items = []
+        justwatch_items = fetch_justwatch_items() if want("justwatch") else []
+        ffzy_items = fetch_ffzy_items() if want("ffzy") else []
+        bfzy_items = fetch_bfzy_items() if want("bfzy") else []
+        mydramalist_items: List[Dict[str, str]] = []
+        if want("mydramalist"):
+            try:
+                mydramalist_items = fetch_mydramalist_items()
+            except Exception as exc:
+                # MyDramaList 可能触发风控，失败时只跳过这个源，不影响其他渠道。
+                logging.error("MyDramaList 获取失败，本次跳过：%s", exc)
+                mydramalist_items = []
 
         baseline_ids: List[str] = []
         if justwatch_items and JUSTWATCH_BOOTSTRAP_ONLY and not any(
@@ -2401,6 +2473,38 @@ def main() -> int:
                 "MyDramaList 首次运行已建立 %s 条基线记录，本次不推送这些历史条目。",
                 baseline_count,
             )
+        elif (
+            mydramalist_items
+            and MYDRAMALIST_INITIAL_PUSH_DAYS > 0
+            and MYDRAMALIST_INITIAL_MARKER not in pushed_set
+        ):
+            # 新模式的第一次运行：只推最近几天到点的，剩下的先记账不推，避免一次刷几十条。
+            horizon = int(
+                (datetime.now(timezone.utc) + timedelta(days=MYDRAMALIST_INITIAL_PUSH_DAYS)).timestamp()
+            )
+            near_term: List[Dict[str, str]] = []
+            deferred = 0
+            for item in mydramalist_items:
+                air_ts = int(item.get("air_ts") or 0)
+                if air_ts and air_ts <= horizon:
+                    near_term.append(item)
+                    continue
+                if item["key"] not in pushed_set:
+                    baseline_ids.append(item["key"])
+                    pushed_set.add(item["key"])
+                    deferred += 1
+
+            if MYDRAMALIST_INITIAL_MARKER not in pushed_set:
+                baseline_ids.append(MYDRAMALIST_INITIAL_MARKER)
+                pushed_set.add(MYDRAMALIST_INITIAL_MARKER)
+
+            logging.info(
+                "MyDramaList 首次启用新模式：只推送 %s 天内到点的 %s 条，其余 %s 条先记为已见。",
+                MYDRAMALIST_INITIAL_PUSH_DAYS,
+                len(near_term),
+                deferred,
+            )
+            calendar_items.extend(near_term)
         else:
             calendar_items.extend(mydramalist_items)
 
@@ -2438,25 +2542,64 @@ def main() -> int:
             new_items.append(item)
             remember_item(item, seen_this_run, new_ids)
 
-        if not new_items:
+        new_id_set = set(new_ids)
+
+        # 开播提醒：日历里已到播出时间、预告已发过、且提醒键还没写进状态的条目。
+        remind_items: List[Dict[str, Any]] = []
+        remind_ids: List[str] = []
+        if MYDRAMALIST_REMIND_AT_AIR and mydramalist_items:
+            now_ts = int(datetime.now(timezone.utc).timestamp())
+            window_start = now_ts - MYDRAMALIST_REMIND_WINDOW_MINUTES * 60
+            announced = pushed_set | new_id_set
+            for item in mydramalist_items:
+                air_ts = int(item.get("air_ts") or 0)
+                remind_key = str(item.get("remind_key") or "")
+                if not air_ts or not remind_key:
+                    continue
+                if not (window_start <= air_ts <= now_ts):
+                    continue
+                # 预告还没发，或就是本轮刚发的预告，都不再额外补一条提醒。
+                if item["key"] not in announced or item["key"] in new_id_set:
+                    continue
+                if remind_key in pushed_set or remind_key in remind_ids:
+                    continue
+                remind_items.append(item)
+                remind_ids.append(remind_key)
+
+        if not new_items and not remind_items:
             if baseline_ids:
                 save_pushed_ids(pushed_ids + baseline_ids)
                 logging.info("已更新 pushed_episodes.json，新增 %s 条基线记录。", len(baseline_ids))
             logging.info("没有发现需要推送的新剧集或电影。")
             return 0
 
-        logging.info("发现 %s 个新条目，准备推送。", len(new_items))
+        if new_items:
+            logging.info("发现 %s 个新条目，准备推送。", len(new_items))
 
-        telegram_ok = send_telegram(new_items)
-        discord_ok = send_discord(new_items)
+            telegram_ok = send_telegram(new_items)
+            discord_ok = send_discord(new_items)
 
-        # 只有所有已配置渠道都成功后才写入去重文件，避免通知失败却被标记为已推送。
-        if not (telegram_ok and discord_ok):
-            logging.error("至少一个推送渠道失败，本次不更新 pushed_episodes.json。")
-            return 1
+            # 只有所有已配置渠道都成功后才写入去重文件，避免通知失败却被标记为已推送。
+            if not (telegram_ok and discord_ok):
+                logging.error("至少一个推送渠道失败，本次不更新 pushed_episodes.json。")
+                return 1
+        else:
+            new_ids = []
 
-        save_pushed_ids(pushed_ids + baseline_ids + new_ids)
-        logging.info("已更新 pushed_episodes.json，新增 %s 条记录。", len(baseline_ids) + len(new_ids))
+        alert_ids: List[str] = []
+        if remind_items:
+            logging.info("发现 %s 条到点开播的提醒，准备推送。", len(remind_items))
+            for item in remind_items:
+                if not send_telegram_alert(item):
+                    logging.warning("开播提醒发送失败，留到下一轮重试：%s", item.get("title"))
+                    break
+                alert_ids.append(str(item["remind_key"]))
+
+        save_pushed_ids(pushed_ids + baseline_ids + new_ids + alert_ids)
+        logging.info(
+            "已更新 pushed_episodes.json，新增 %s 条记录。",
+            len(baseline_ids) + len(new_ids) + len(alert_ids),
+        )
         return 0
 
     except Exception as exc:
@@ -2464,5 +2607,16 @@ def main() -> int:
         return 1
 
 
+def parse_only_argument(argv: Sequence[str]) -> str:
+    """解析 --only 参数，例如 python trakt_bot.py --only mydramalist。"""
+    args = list(argv)
+    for index, arg in enumerate(args):
+        if arg == "--only" and index + 1 < len(args):
+            return args[index + 1].strip().lower()
+        if arg.startswith("--only="):
+            return arg.split("=", 1)[1].strip().lower()
+    return ""
+
+
 if __name__ == "__main__":
-    sys.exit(main())
+    sys.exit(main(parse_only_argument(sys.argv[1:])))

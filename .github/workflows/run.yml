@@ -80,7 +80,9 @@ jobs:
           BFZY_MAX_ITEMS: ${{ vars.BFZY_MAX_ITEMS || '200' }}
           BFZY_MAX_AGE_HOURS: ${{ vars.BFZY_MAX_AGE_HOURS || '168' }}
           BFZY_REQUEST_TIMEOUT: ${{ vars.BFZY_REQUEST_TIMEOUT || '8' }}
-          MYDRAMALIST_ENABLED: ${{ vars.MYDRAMALIST_ENABLED || 'true' }}
+          # MyDramaList 已拆到 .github/workflows/mydramalist.yml 每 5 分钟单独跑，
+          # 这里关掉，避免同一个源被两处重复推送。
+          MYDRAMALIST_ENABLED: ${{ vars.MYDRAMALIST_ENABLED || 'false' }}
           MYDRAMALIST_COUNTRIES: ${{ vars.MYDRAMALIST_COUNTRIES }}
           MYDRAMALIST_TYPES: ${{ vars.MYDRAMALIST_TYPES }}
           MYDRAMALIST_TIMEZONE: ${{ vars.MYDRAMALIST_TIMEZONE || 'Asia/Shanghai' }}
