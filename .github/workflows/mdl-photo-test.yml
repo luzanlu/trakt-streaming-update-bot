@@ -1,0 +1,36 @@
+name: MDL photo test
+
+on:
+  workflow_dispatch:
+
+jobs:
+  send:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+      - run: pip install -r requirements.txt
+      - name: Send one photo card
+        env:
+          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+          MYDRAMALIST_ENABLED: "true"
+          MYDRAMALIST_ONLY_AIRED: "true"
+        run: |
+          python - <<'PY'
+          import logging
+          import trakt_bot as t
+
+          logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
+          items = t.fetch_mydramalist_items()
+          print("FETCHED:", len(items))
+          if not items:
+              print("NO_ITEMS")
+              raise SystemExit(1)
+          for it in items[:3]:
+              print("ITEM:", it["title"], it["code"], it["aired"])
+          item = items[0]
+          print("SENT:", t.send_telegram_photo(item))
+          PY
