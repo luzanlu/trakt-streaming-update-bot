@@ -18,6 +18,11 @@ from zoneinfo import ZoneInfo
 
 import requests
 
+try:  # 可选依赖：真实浏览器 TLS 指纹，降低 Cloudflare 拦截概率
+    from curl_cffi import requests as curl_cffi_requests
+except Exception:  # pragma: no cover - 未安装时退回 requests
+    curl_cffi_requests = None
+
 
 def parse_bool_env(name: str, default: bool = False) -> bool:
     raw = os.getenv(name)
@@ -418,6 +423,7 @@ MYDRAMALIST_USER_AGENT = os.getenv(
     "Chrome/126.0.0.0 Safari/537.36",
 ).strip()
 MYDRAMALIST_COOKIE = os.getenv("MYDRAMALIST_COOKIE", "").strip()
+MYDRAMALIST_CARD_MARKER = '<div class="episode-card-large">'
 
 
 JUSTWATCH_BUCKETS_GRAPHQL_QUERY = """
@@ -1089,10 +1095,6 @@ def mydramalist_headers() -> Dict[str, str]:
         "User-Agent": MYDRAMALIST_USER_AGENT,
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
         "Accept-Language": "en-US,en;q=0.9",
-        "Upgrade-Insecure-Requests": "1",
-        "Sec-Fetch-Dest": "document",
-        "Sec-Fetch-Mode": "navigate",
-        "Sec-Fetch-Site": "none",
     }
     if MYDRAMALIST_COOKIE:
         headers["Cookie"] = MYDRAMALIST_COOKIE
@@ -1105,21 +1107,9 @@ def fetch_mydramalist_items() -> List[Dict[str, str]]:
         return []
 
     url = mydramalist_calendar_url()
-    try:
-        response = requests.get(
-            url,
-            headers=mydramalist_headers(),
-            timeout=MYDRAMALIST_REQUEST_TIMEOUT,
-        )
-    except requests.RequestException as exc:
-        raise RuntimeError(f"请求 MyDramaList 日历失败：{exc}") from exc
+    page_html = request_mydramalist_html(url)
 
-    if response.status_code >= 400:
-        raise RuntimeError(
-            f"MyDramaList 日历返回错误：HTTP {response.status_code} - {response.text[:300]}"
-        )
-
-    items = parse_mydramalist_calendar(response.text)
+    items = parse_mydramalist_calendar(page_html)
     logging.info(
         "MyDramaList 解析到 %s 个条目（国家：%s；类型：%s）。",
         len(items),
@@ -1127,6 +1117,40 @@ def fetch_mydramalist_items() -> List[Dict[str, str]]:
         ",".join(MYDRAMALIST_TYPES) or "全部",
     )
     return items[:MYDRAMALIST_MAX_ITEMS]
+
+
+def request_mydramalist_html(url: str) -> str:
+    """优先用浏览器指纹抓取，失败后退回 requests；两者都带有 Cloudflare 检出判断。"""
+    errors: List[str] = []
+    headers = mydramalist_headers()
+
+    if curl_cffi_requests is not None:
+        try:
+            response = curl_cffi_requests.get(
+                url,
+                headers=headers,
+                impersonate="chrome",
+                timeout=MYDRAMALIST_REQUEST_TIMEOUT,
+            )
+            if response.status_code < 400 and MYDRAMALIST_CARD_MARKER in response.text:
+                logging.info("MyDramaList 抓取成功（curl_cffi / chrome 指纹）。")
+                return response.text
+            errors.append(f"curl_cffi: HTTP {response.status_code}")
+        except Exception as exc:
+            errors.append(f"curl_cffi: {type(exc).__name__} {exc}")
+
+    try:
+        response = requests.get(url, headers=headers, timeout=MYDRAMALIST_REQUEST_TIMEOUT)
+        if response.status_code < 400 and MYDRAMALIST_CARD_MARKER in response.text:
+            logging.info("MyDramaList 抓取成功（requests）。")
+            return response.text
+        errors.append(f"requests: HTTP {response.status_code}")
+    except requests.RequestException as exc:
+        errors.append(f"requests: {exc}")
+
+    raise RuntimeError(
+        "MyDramaList 请求失败，可能被 Cloudflare 拦截：" + "; ".join(errors[-3:])
+    )
 
 
 def parse_mydramalist_calendar(page_html: str) -> List[Dict[str, str]]:
@@ -1150,7 +1174,7 @@ def parse_mydramalist_calendar(page_html: str) -> List[Dict[str, str]]:
         block_end = day_matches[index + 1].start() if index + 1 < len(day_matches) else len(page_html)
         block = page_html[block_start:block_end]
 
-        for card in block.split('<div class="episode-card-large">')[1:]:
+        for card in block.split(MYDRAMALIST_CARD_MARKER)[1:]:
             item = extract_mydramalist_item(card, day_text, now, allowed_until)
             if not item or item["key"] in seen:
                 continue

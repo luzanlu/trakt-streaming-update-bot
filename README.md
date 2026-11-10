@@ -185,7 +185,7 @@ GitHub Actions 默认启用 MyDramaList。脚本直接抓取剧集日历页（`/
 - `MYDRAMALIST_MAX_ITEMS`：每次最多处理多少条，默认 `200`
 - `MYDRAMALIST_REQUEST_TIMEOUT`：请求超时时间，默认 `20` 秒
 
-该站点有 Cloudflare 防护，机房 IP 偶尔会被拦。如果 Actions 日志出现 `HTTP 403`，在本地浏览器打开日历页复制 `cf_clearance` 等 Cookie，配置为 Secret `MYDRAMALIST_COOKIE`（整行 `name=value; name2=value2`）即可。抓取失败只跳过这个源，不影响 Trakt、JustWatch 和资源站推送。
+该站点有 Cloudflare 防护，机房 IP 偶尔会被拦。脚本会先用 `curl_cffi`（真实 Chrome TLS 指纹）抓取，失败再退回 `requests`，两种方式都拿不到内容时才跳过。`requirements.txt` 已包含 `curl-cffi`。如果日志出现 `HTTP 403`，在本地浏览器打开日历页复制 `cf_clearance` 等 Cookie，配置为 Secret `MYDRAMALIST_COOKIE`（整行 `name=value; name2=value2`）即可。抓取失败只跳过这个源，不影响 Trakt、JustWatch 和资源站推送。
 
 ## 资源站去重
 
