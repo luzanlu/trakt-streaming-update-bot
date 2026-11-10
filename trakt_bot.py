@@ -8,6 +8,7 @@ import re
 import shutil
 import subprocess
 import sys
+import time
 import unicodedata
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -480,6 +481,8 @@ TRAKT_FORCE_REFRESH = parse_bool_env("TRAKT_FORCE_REFRESH", False)
 TG_BOT_TOKEN = os.getenv("TG_BOT_TOKEN", "").strip()
 TG_CHAT_ID = os.getenv("TG_CHAT_ID", "").strip()
 DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL", "").strip()
+# 一次可能连发十几张图，Telegram 对同一会话有速率限制，发送之间留一点间隔。
+TELEGRAM_PHOTO_INTERVAL = 1.2
 
 GITHUB_REPOSITORY = os.getenv("GITHUB_REPOSITORY", "").strip()
 GH_SECRET_WRITE_TOKEN = os.getenv("GH_SECRET_WRITE_TOKEN", "").strip()
@@ -2265,6 +2268,26 @@ def send_telegram_photo(item: Dict[str, Any]) -> bool:
         logging.error("发送 Telegram 图文失败：%s", exc)
         return False
 
+    if response.status_code == 429:
+        # 连发多张图可能触发限流，按 Telegram 给的 retry_after 等一次再发。
+        retry_after = 5
+        try:
+            retry_after = int(response.json().get("parameters", {}).get("retry_after", 5))
+        except Exception:
+            pass
+        logging.warning("Telegram 限流，等待 %s 秒后重发：%s", retry_after, item.get("title"))
+        time.sleep(min(max(retry_after, 1), 60))
+        try:
+            if image:
+                response = requests.post(
+                    api, data=data, files={"photo": ("cover.jpg", image)}, timeout=REQUEST_TIMEOUT * 3
+                )
+            else:
+                response = requests.post(api, data=data, timeout=REQUEST_TIMEOUT)
+        except requests.RequestException as exc:
+            logging.error("发送 Telegram 图文失败：%s", exc)
+            return False
+
     if response.status_code >= 400:
         logging.error(
             "Telegram sendPhoto 返回错误：HTTP %s - %s",
@@ -2289,6 +2312,7 @@ def send_telegram(items: Sequence[Dict[str, str]]) -> bool:
         return False
 
     for item in photo_items:
+        time.sleep(TELEGRAM_PHOTO_INTERVAL)
         if send_telegram_photo(item):
             continue
         logging.warning("图文推送失败，回退为文本：%s %s", item.get("title"), item.get("code"))
