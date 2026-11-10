@@ -1208,6 +1208,9 @@ def extract_mydramalist_item(
     image = first_mydramalist_text(
         card_html, r'<img class="img-responsive"[^>]*src="([^"]+)"', re.S
     )
+    # 列表页给的是 4c 小图，换成 4f 原图，Telegram 卡片更清晰。
+    if image.endswith("_4c.jpg"):
+        image = image[: -len("_4c.jpg")] + "_4f.jpg"
     synopsis = first_mydramalist_text(
         card_html, r'<p class="synopsis">\s*(.*?)\s*</p>', re.S
     )
@@ -2150,7 +2153,7 @@ def build_telegram_caption(item: Dict[str, Any]) -> str:
 
 
 def fetch_photo_bytes(url: str) -> Optional[bytes]:
-    """下载封面图，优先用浏览器指纹，失败后回落 requests。"""
+    """下载封面图，优先用浏览器指纹，失败后回落 requests；原图 404 时退回小图。"""
     if not url:
         return None
     headers = {
@@ -2159,23 +2162,28 @@ def fetch_photo_bytes(url: str) -> Optional[bytes]:
         "Referer": "https://mydramalist.com/",
     }
 
-    if curl_cffi_requests is not None:
+    candidates = [url]
+    if url.endswith("_4f.jpg"):
+        candidates.append(url[: -len("_4f.jpg")] + "_4c.jpg")
+
+    for candidate in candidates:
+        if curl_cffi_requests is not None:
+            try:
+                response = curl_cffi_requests.get(
+                    candidate, headers=headers, impersonate="chrome", timeout=MYDRAMALIST_REQUEST_TIMEOUT
+                )
+                if response.status_code < 400 and response.content:
+                    return response.content
+            except Exception as exc:
+                logging.warning("curl_cffi 下载封面失败：%s", exc)
+
         try:
-            response = curl_cffi_requests.get(
-                url, headers=headers, impersonate="chrome", timeout=MYDRAMALIST_REQUEST_TIMEOUT
-            )
+            response = requests.get(candidate, headers=headers, timeout=MYDRAMALIST_REQUEST_TIMEOUT)
             if response.status_code < 400 and response.content:
                 return response.content
-        except Exception as exc:
-            logging.warning("curl_cffi 下载封面失败：%s", exc)
-
-    try:
-        response = requests.get(url, headers=headers, timeout=MYDRAMALIST_REQUEST_TIMEOUT)
-        if response.status_code < 400 and response.content:
-            return response.content
-        logging.warning("下载封面返回 HTTP %s：%s", response.status_code, url)
-    except requests.RequestException as exc:
-        logging.warning("下载封面失败：%s - %s", url, exc)
+            logging.warning("下载封面返回 HTTP %s：%s", response.status_code, candidate)
+        except requests.RequestException as exc:
+            logging.warning("下载封面失败：%s - %s", candidate, exc)
 
     return None
 
