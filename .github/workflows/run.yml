@@ -80,6 +80,16 @@ jobs:
           BFZY_MAX_ITEMS: ${{ vars.BFZY_MAX_ITEMS || '200' }}
           BFZY_MAX_AGE_HOURS: ${{ vars.BFZY_MAX_AGE_HOURS || '168' }}
           BFZY_REQUEST_TIMEOUT: ${{ vars.BFZY_REQUEST_TIMEOUT || '8' }}
+          MYDRAMALIST_ENABLED: ${{ vars.MYDRAMALIST_ENABLED || 'true' }}
+          MYDRAMALIST_COUNTRIES: ${{ vars.MYDRAMALIST_COUNTRIES }}
+          MYDRAMALIST_TYPES: ${{ vars.MYDRAMALIST_TYPES }}
+          MYDRAMALIST_TIMEZONE: ${{ vars.MYDRAMALIST_TIMEZONE || 'Asia/Shanghai' }}
+          MYDRAMALIST_ONLY_AIRED: ${{ vars.MYDRAMALIST_ONLY_AIRED || 'true' }}
+          MYDRAMALIST_LOOKAHEAD_HOURS: ${{ vars.MYDRAMALIST_LOOKAHEAD_HOURS || '0' }}
+          MYDRAMALIST_BOOTSTRAP_ONLY: ${{ vars.MYDRAMALIST_BOOTSTRAP_ONLY || 'true' }}
+          MYDRAMALIST_MAX_ITEMS: ${{ vars.MYDRAMALIST_MAX_ITEMS || '200' }}
+          MYDRAMALIST_REQUEST_TIMEOUT: ${{ vars.MYDRAMALIST_REQUEST_TIMEOUT || '20' }}
+          MYDRAMALIST_COOKIE: ${{ secrets.MYDRAMALIST_COOKIE }}
         run: python trakt_bot.py
 
       - name: Commit pushed episode state
