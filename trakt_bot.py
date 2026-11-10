@@ -1214,6 +1214,9 @@ def extract_mydramalist_item(
     synopsis = first_mydramalist_text(
         card_html, r'<p class="synopsis">\s*(.*?)\s*</p>', re.S
     )
+    popover_time = first_mydramalist_text(
+        card_html, r'<span class="text-muted">\(([^)]*)\)</span>'
+    )
     genres = [
         genre.strip()
         for genre in re.findall(r'<div class="genre">\s*([^<]*?)\s*</div>', card_html)
@@ -1230,7 +1233,9 @@ def extract_mydramalist_item(
     episode_path = episode_match.group(0).split('"')[1] if episode_match else ""
     show_path = show_match.group(0).split('"')[1] if show_match else ""
 
-    aired_dt, aired_iso = mydramalist_air_time(day_text, release_time, show_timezone)
+    aired_dt, aired_iso = mydramalist_air_time(
+        day_text, popover_time, release_time, show_timezone
+    )
     aired_text = f"{day_text} {release_time}".strip()
     if aired_dt is not None:
         if MYDRAMALIST_ONLY_AIRED and aired_dt > allowed_until:
@@ -1283,10 +1288,32 @@ def mydramalist_zone(name: str):
 
 def mydramalist_air_time(
     day_text: str,
+    popover_text: str,
     release_time: str,
     show_timezone: str,
 ) -> Tuple[Optional[datetime], str]:
-    """把「日期 + 当地播出时间 + 时区」换算成 UTC 时间。"""
+    """把播出时间换算成 UTC。
+
+    页面上的粗体时间是按访问者 IP 所在时区渲染的，不能直接用；
+    弹层括号里的 (November 11, 2026 8:30 PM) 才是剧集当地时间的绝对值。
+    """
+    zone = mydramalist_zone(show_timezone)
+
+    absolute = (popover_text or "").strip()
+    if absolute:
+        try:
+            local = datetime.strptime(absolute, "%B %d, %Y %I:%M %p").replace(tzinfo=zone)
+            return local.astimezone(timezone.utc), local.strftime("%Y-%m-%d %H:%M")
+        except ValueError:
+            pass
+        for date_format in ("%B %d, %Y", "%B %d %Y"):
+            try:
+                day_only = datetime.strptime(absolute, date_format).date()
+                local = datetime(day_only.year, day_only.month, day_only.day, tzinfo=zone)
+                return local.astimezone(timezone.utc), f"{day_only:%Y-%m-%d} 全天"
+            except ValueError:
+                continue
+
     try:
         day = datetime.strptime(day_text.strip(), "%B %d, %Y").date()
     except ValueError:
@@ -1295,7 +1322,7 @@ def mydramalist_air_time(
     match = re.match(r"(\d{1,2}):(\d{2})\s*([AaPp][Mm])", release_time.strip())
     if not match:
         # 电影等条目只有日期没有时间，按当天 00:00 处理。
-        local_day = datetime(day.year, day.month, day.day, tzinfo=mydramalist_zone(show_timezone))
+        local_day = datetime(day.year, day.month, day.day, tzinfo=zone)
         return local_day.astimezone(timezone.utc), f"{day.year:04d}-{day.month:02d}-{day.day:02d} 全天"
 
     hour = int(match.group(1)) % 12
@@ -1303,7 +1330,7 @@ def mydramalist_air_time(
         hour += 12
     minute = int(match.group(2))
 
-    local = datetime(day.year, day.month, day.day, hour, minute, tzinfo=mydramalist_zone(show_timezone))
+    local = datetime(day.year, day.month, day.day, hour, minute, tzinfo=zone)
     return local.astimezone(timezone.utc), f"{day.year:04d}-{day.month:02d}-{day.day:02d} {hour:02d}:{minute:02d}"
 
 MYDRAMALIST_COUNTRY_LABELS = {
