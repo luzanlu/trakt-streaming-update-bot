@@ -173,6 +173,8 @@ GitHub Actions 默认启用 MyDramaList。脚本直接抓取剧集日历页（`/
 
 去重键格式为 `mydramalist:{剧集ID}:ep{集数}`，电影为 `mydramalist:{剧集ID}:movie`。
 
+Telegram 渠道会把 MyDramaList 条目发成**图文卡片**：封面图 + 剧名（可点击）、集数、播出时间、题材、评分、简介，并附「在 MyDramaList 查看」按钮，点一下直接进站点。图片由脚本先下载再上传，避免 Telegram 侧抓取被 Cloudflare 拦。图片下载或发送失败时会自动回退成文本摘要，不会漏推。其他来源（Trakt、JustWatch、FFZY、BFZY）仍合并成一条文本摘要，链接改为可点击的 MarkdownV2 内联链接。
+
 可以在仓库 Settings -> Secrets and variables -> Actions -> Variables 中调整：
 
 - `MYDRAMALIST_ENABLED`：是否启用，默认 `true`

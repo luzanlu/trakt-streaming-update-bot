@@ -1202,7 +1202,15 @@ def extract_mydramalist_item(
     show_timezone = first_mydramalist_text(
         card_html, r'<div class="calendar-popover-title">\s*([^<]*?)\s*</div>'
     )
-    score = first_mydramalist_text(card_html, r'class="p-l-xs score">\s*([^<]*?)\s*</div>')
+    score = first_mydramalist_text(
+        card_html, r'<span class="p-l-xs score">\s*([^<]*?)\s*</span>'
+    )
+    image = first_mydramalist_text(
+        card_html, r'<img class="img-responsive"[^>]*src="([^"]+)"', re.S
+    )
+    synopsis = first_mydramalist_text(
+        card_html, r'<p class="synopsis">\s*(.*?)\s*</p>', re.S
+    )
     genres = [
         genre.strip()
         for genre in re.findall(r'<div class="genre">\s*([^<]*?)\s*</div>', card_html)
@@ -1230,8 +1238,6 @@ def extract_mydramalist_item(
     key = f"mydramalist:{show_id}:ep{episode_number}" if episode_number else f"mydramalist:{show_id}:movie"
 
     subtitle_parts = list(genres)
-    if score:
-        subtitle_parts.append(f"评分 {score}")
 
     source_parts = ["MyDramaList"]
     if content_type:
@@ -1252,11 +1258,14 @@ def extract_mydramalist_item(
         "source": " · ".join(source_parts),
         "url": f"https://mydramalist.com{page_path}" if page_path else "",
         "country": content_type,
+        "image": image,
+        "score": score,
+        "synopsis": clean_ffzy_text(synopsis, ""),
     }
 
 
-def first_mydramalist_text(card_html: str, pattern: str) -> str:
-    match = re.search(pattern, card_html)
+def first_mydramalist_text(card_html: str, pattern: str, flags: int = 0) -> str:
+    match = re.search(pattern, card_html, flags)
     if not match:
         return ""
     return html.unescape(match.group(1)).strip()
@@ -2070,8 +2079,13 @@ def build_telegram_message(items: Sequence[Dict[str, str]]) -> str:
             ]
         )
         if item.get("url"):
-            lines.insert(-1, f"• 链接：{escape_markdown_v2(item['url'])}")
+            lines.insert(-1, f"• 链接：[打开]({escape_markdown_v2_url(item['url'])})")
     return "\n".join(lines).strip()
+
+
+def escape_markdown_v2_url(url: str) -> str:
+    """MarkdownV2 链接地址里只需要转义反斜杠和右括号。"""
+    return str(url).replace("\\", "\\\\").replace(")", "\\)")
 
 
 def split_message(text: str, limit: int) -> List[str]:
@@ -2105,10 +2119,129 @@ def split_message(text: str, limit: int) -> List[str]:
     return chunks
 
 
+def telegram_html(value: Any) -> str:
+    return html.escape(str(value), quote=False)
+
+
+def build_telegram_caption(item: Dict[str, Any]) -> str:
+    """图文卡片的说明文字：标题可点、集数、播出时间、题材、评分、简介。"""
+    title = telegram_html(item.get("title", ""))
+    caption_url = telegram_html(item.get("url", ""))
+    lines = [f'<b><a href="{caption_url}">{title}</a></b>'] if caption_url else [f"<b>{title}</b>"]
+
+    meta = [part for part in (item.get("label"), item.get("code")) if part]
+    if meta:
+        lines.append(" · ".join(telegram_html(part) for part in meta))
+
+    if item.get("aired"):
+        lines.append(f"播出：{telegram_html(item['aired'])}")
+    if item.get("subtitle"):
+        lines.append(f"题材：{telegram_html(item['subtitle'])}")
+    if item.get("score"):
+        lines.append(f"评分：{telegram_html(item['score'])}")
+
+    synopsis = (item.get("synopsis") or "").strip()
+    if synopsis:
+        if len(synopsis) > 160:
+            synopsis = synopsis[:160].rstrip() + "…"
+        lines.append(f"简介：{telegram_html(synopsis)}")
+
+    return "\n".join(lines)[:1024]
+
+
+def fetch_photo_bytes(url: str) -> Optional[bytes]:
+    """下载封面图，优先用浏览器指纹，失败后回落 requests。"""
+    if not url:
+        return None
+    headers = {
+        "User-Agent": MYDRAMALIST_USER_AGENT,
+        "Accept": "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
+        "Referer": "https://mydramalist.com/",
+    }
+
+    if curl_cffi_requests is not None:
+        try:
+            response = curl_cffi_requests.get(
+                url, headers=headers, impersonate="chrome", timeout=MYDRAMALIST_REQUEST_TIMEOUT
+            )
+            if response.status_code < 400 and response.content:
+                return response.content
+        except Exception as exc:
+            logging.warning("curl_cffi 下载封面失败：%s", exc)
+
+    try:
+        response = requests.get(url, headers=headers, timeout=MYDRAMALIST_REQUEST_TIMEOUT)
+        if response.status_code < 400 and response.content:
+            return response.content
+        logging.warning("下载封面返回 HTTP %s：%s", response.status_code, url)
+    except requests.RequestException as exc:
+        logging.warning("下载封面失败：%s - %s", url, exc)
+
+    return None
+
+
+def send_telegram_photo(item: Dict[str, Any]) -> bool:
+    """发一条带封面的图文消息，并附「在 MyDramaList 查看」按钮。"""
+    api = f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendPhoto"
+    caption = build_telegram_caption(item)
+    data: Dict[str, Any] = {
+        "chat_id": TG_CHAT_ID,
+        "caption": caption,
+        "parse_mode": "HTML",
+    }
+    if item.get("url"):
+        data["reply_markup"] = json.dumps(
+            {"inline_keyboard": [[{"text": "在 MyDramaList 查看", "url": item["url"]}]]},
+            ensure_ascii=False,
+        )
+
+    image = fetch_photo_bytes(item.get("image", ""))
+    try:
+        if image:
+            response = requests.post(
+                api, data=data, files={"photo": ("cover.jpg", image)}, timeout=REQUEST_TIMEOUT * 3
+            )
+        else:
+            data["photo"] = item["image"]
+            response = requests.post(api, data=data, timeout=REQUEST_TIMEOUT)
+    except requests.RequestException as exc:
+        logging.error("发送 Telegram 图文失败：%s", exc)
+        return False
+
+    if response.status_code >= 400:
+        logging.error(
+            "Telegram sendPhoto 返回错误：HTTP %s - %s",
+            response.status_code,
+            response.text[:500],
+        )
+        return False
+
+    logging.info("Telegram 图文发送成功：%s %s", item.get("title"), item.get("code"))
+    return True
+
+
 def send_telegram(items: Sequence[Dict[str, str]]) -> bool:
     if not (TG_BOT_TOKEN and TG_CHAT_ID):
         return True
 
+    # 带封面的条目（目前为 MyDramaList）单独发图文，其余合并成文本摘要。
+    photo_items = [item for item in items if item.get("image") and item.get("url")]
+    text_items = [item for item in items if not (item.get("image") and item.get("url"))]
+
+    if text_items and not send_telegram_digest(text_items):
+        return False
+
+    for item in photo_items:
+        if send_telegram_photo(item):
+            continue
+        logging.warning("图文推送失败，回退为文本：%s %s", item.get("title"), item.get("code"))
+        if not send_telegram_digest([item]):
+            return False
+
+    return True
+
+
+def send_telegram_digest(items: Sequence[Dict[str, str]]) -> bool:
     url = f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage"
     message = build_telegram_message(items)
     chunks = split_message(message, 3900)
