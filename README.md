@@ -6,6 +6,8 @@ GitHub Actions 每 30 分钟运行一次，读取 Trakt.tv 个人剧集和电影
 
 脚本还支持 FFZY 和 BFZY 采集接口追踪，只推送指定剧集和动漫分类的新更新。FFZY 与 BFZY 会按剧名和集数做跨站去重：同一部同一集哪个站先更新就推送哪个，后更新的站不会重复推送。
 
+脚本还支持 MyDramaList 剧集日历追踪，可按国家/地区和内容类型筛选新播出的集数，默认追踪韩国剧集。
+
 ## GitHub Secrets
 
 必须配置：
@@ -162,6 +164,28 @@ GitHub Actions 默认启用 BFZY。首次启用时，脚本会把当前 BFZY 最
 - `BFZY_MAX_ITEMS`：每次最多处理多少个 BFZY 条目，默认 `200`
 - `BFZY_MAX_AGE_HOURS`：只处理最近多少小时的 BFZY 更新，默认 `168`；设为 `0` 表示不过滤时间
 - `BFZY_REQUEST_TIMEOUT`：单个 BFZY 域名请求超时时间，默认 `8` 秒
+
+## MyDramaList 追踪
+
+GitHub Actions 默认启用 MyDramaList。脚本直接抓取剧集日历页（`/episode-calendar`），按卡片里的「日期 + 当地播出时间 + 时区」换算成 UTC，再和当前时间比较，默认只推送已经播出的集数，避免提前预告。
+
+首次启用时，脚本会把当前页面上符合条件的条目写入基线状态，不会一次性推送历史条目；后续同一部剧的新集数才会推送。
+
+去重键格式为 `mydramalist:{剧集ID}:ep{集数}`，电影为 `mydramalist:{剧集ID}:movie`。
+
+可以在仓库 Settings -> Secrets and variables -> Actions -> Variables 中调整：
+
+- `MYDRAMALIST_ENABLED`：是否启用，默认 `true`
+- `MYDRAMALIST_COUNTRIES`：国家/地区，多个值用逗号或换行分隔，默认 `South Korea`；可选 `Japan`、`China`、`Hong Kong`、`Taiwan`、`Thailand`、`Philippines`、`Singapore`
+- `MYDRAMALIST_TYPES`：内容类型，多个值用逗号或换行分隔，默认 `Drama`；可选 `Movie`、`TV Show`、`Special`
+- `MYDRAMALIST_TIMEZONE`：页面时区参数，默认 `Asia/Shanghai`
+- `MYDRAMALIST_ONLY_AIRED`：是否只推送已播出的集数，默认 `true`；设为 `false` 会推送未来 7 天内的全部条目
+- `MYDRAMALIST_LOOKAHEAD_HOURS`：提前多少小时把即将播出的条目也算作可推送，默认 `0`
+- `MYDRAMALIST_BOOTSTRAP_ONLY`：首次启用是否只建立基线，默认 `true`
+- `MYDRAMALIST_MAX_ITEMS`：每次最多处理多少条，默认 `200`
+- `MYDRAMALIST_REQUEST_TIMEOUT`：请求超时时间，默认 `20` 秒
+
+该站点有 Cloudflare 防护，机房 IP 偶尔会被拦。如果 Actions 日志出现 `HTTP 403`，在本地浏览器打开日历页复制 `cf_clearance` 等 Cookie，配置为 Secret `MYDRAMALIST_COOKIE`（整行 `name=value; name2=value2`）即可。抓取失败只跳过这个源，不影响 Trakt、JustWatch 和资源站推送。
 
 ## 资源站去重
 

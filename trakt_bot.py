@@ -13,7 +13,8 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
-from urllib.parse import unquote, urljoin, urlparse
+from urllib.parse import unquote, urlencode, urljoin, urlparse
+from zoneinfo import ZoneInfo
 
 import requests
 
@@ -400,6 +401,25 @@ BFZY_PAGES_PER_TYPE = max(1, config_int("bfzy", "pages_per_type", "BFZY_PAGES_PE
 BFZY_MAX_ITEMS = max(1, config_int("bfzy", "max_items", "BFZY_MAX_ITEMS", 200))
 BFZY_MAX_AGE_HOURS = max(0, config_int("bfzy", "max_age_hours", "BFZY_MAX_AGE_HOURS", 168))
 BFZY_REQUEST_TIMEOUT = max(1, config_int("bfzy", "request_timeout", "BFZY_REQUEST_TIMEOUT", 8))
+
+MYDRAMALIST_CALENDAR_URL = "https://mydramalist.com/episode-calendar"
+MYDRAMALIST_ENABLED = config_bool("mydramalist", "enabled", "MYDRAMALIST_ENABLED", False)
+MYDRAMALIST_COUNTRIES = config_list("mydramalist", "countries", "MYDRAMALIST_COUNTRIES", ["South Korea"])
+MYDRAMALIST_TYPES = config_list("mydramalist", "types", "MYDRAMALIST_TYPES", ["Drama"])
+MYDRAMALIST_TIMEZONE = config_str("mydramalist", "timezone", "MYDRAMALIST_TIMEZONE", "Asia/Shanghai")
+MYDRAMALIST_ONLY_AIRED = config_bool("mydramalist", "only_aired", "MYDRAMALIST_ONLY_AIRED", True)
+MYDRAMALIST_LOOKAHEAD_HOURS = max(0, config_int("mydramalist", "lookahead_hours", "MYDRAMALIST_LOOKAHEAD_HOURS", 0))
+MYDRAMALIST_BOOTSTRAP_ONLY = config_bool("mydramalist", "bootstrap_only", "MYDRAMALIST_BOOTSTRAP_ONLY", True)
+MYDRAMALIST_MAX_ITEMS = max(1, config_int("mydramalist", "max_items", "MYDRAMALIST_MAX_ITEMS", 200))
+MYDRAMALIST_REQUEST_TIMEOUT = max(1, config_int("mydramalist", "request_timeout", "MYDRAMALIST_REQUEST_TIMEOUT", 20))
+MYDRAMALIST_USER_AGENT = os.getenv(
+    "MYDRAMALIST_USER_AGENT",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/126.0.0.0 Safari/537.36",
+).strip()
+MYDRAMALIST_COOKIE = os.getenv("MYDRAMALIST_COOKIE", "").strip()
+
+
 JUSTWATCH_BUCKETS_GRAPHQL_QUERY = """
 query GetNewTitleBuckets(
   $country: Country!
@@ -1054,6 +1074,254 @@ def fetch_justwatch_page_items(url: str) -> List[Dict[str, str]]:
                 items.append(item)
 
     return items
+
+
+def mydramalist_calendar_url() -> str:
+    """按国家和内容类型拼出 MyDramaList 剧集日历地址。"""
+    params: List[Tuple[str, str]] = [("view", "large"), ("scope", "all"), ("tz", MYDRAMALIST_TIMEZONE)]
+    params.extend(("country[]", country) for country in MYDRAMALIST_COUNTRIES)
+    params.extend(("type[]", media_type) for media_type in MYDRAMALIST_TYPES)
+    return f"{MYDRAMALIST_CALENDAR_URL}?{urlencode(params)}"
+
+
+def mydramalist_headers() -> Dict[str, str]:
+    headers = {
+        "User-Agent": MYDRAMALIST_USER_AGENT,
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Upgrade-Insecure-Requests": "1",
+        "Sec-Fetch-Dest": "document",
+        "Sec-Fetch-Mode": "navigate",
+        "Sec-Fetch-Site": "none",
+    }
+    if MYDRAMALIST_COOKIE:
+        headers["Cookie"] = MYDRAMALIST_COOKIE
+    return headers
+
+
+def fetch_mydramalist_items() -> List[Dict[str, str]]:
+    """抓取 MyDramaList 剧集日历页面，解析成统一推送条目。"""
+    if not MYDRAMALIST_ENABLED:
+        return []
+
+    url = mydramalist_calendar_url()
+    try:
+        response = requests.get(
+            url,
+            headers=mydramalist_headers(),
+            timeout=MYDRAMALIST_REQUEST_TIMEOUT,
+        )
+    except requests.RequestException as exc:
+        raise RuntimeError(f"请求 MyDramaList 日历失败：{exc}") from exc
+
+    if response.status_code >= 400:
+        raise RuntimeError(
+            f"MyDramaList 日历返回错误：HTTP {response.status_code} - {response.text[:300]}"
+        )
+
+    items = parse_mydramalist_calendar(response.text)
+    logging.info(
+        "MyDramaList 解析到 %s 个条目（国家：%s；类型：%s）。",
+        len(items),
+        ",".join(MYDRAMALIST_COUNTRIES) or "全部",
+        ",".join(MYDRAMALIST_TYPES) or "全部",
+    )
+    return items[:MYDRAMALIST_MAX_ITEMS]
+
+
+def parse_mydramalist_calendar(page_html: str) -> List[Dict[str, str]]:
+    """解析日历页：按天分组，再逐张卡片提取剧名、集数和播出时间。"""
+    day_matches = list(
+        re.finditer(r'<div id="d\d+">\s*<small>\s*([^<]*?)\s*</small>', page_html)
+    )
+    if not day_matches:
+        logging.warning("MyDramaList 页面未找到日历分组，可能被拦截或页面结构已变。")
+        return []
+
+    now = datetime.now(timezone.utc)
+    allowed_until = now + timedelta(hours=MYDRAMALIST_LOOKAHEAD_HOURS)
+
+    items: List[Dict[str, str]] = []
+    seen = set()
+
+    for index, match in enumerate(day_matches):
+        day_text = match.group(1)
+        block_start = match.end()
+        block_end = day_matches[index + 1].start() if index + 1 < len(day_matches) else len(page_html)
+        block = page_html[block_start:block_end]
+
+        for card in block.split('<div class="episode-card-large">')[1:]:
+            item = extract_mydramalist_item(card, day_text, now, allowed_until)
+            if not item or item["key"] in seen:
+                continue
+            seen.add(item["key"])
+            items.append(item)
+
+    items.sort(key=lambda item: item.get("aired", ""), reverse=True)
+    return items
+
+
+def extract_mydramalist_item(
+    card_html: str,
+    day_text: str,
+    now: datetime,
+    allowed_until: datetime,
+) -> Optional[Dict[str, str]]:
+    title = first_mydramalist_text(card_html, r'<div class="title">\s*([^<]*?)\s*</div>')
+    if not title:
+        return None
+
+    content_type = first_mydramalist_text(card_html, r'<div class="content-type">\s*([^<]*?)\s*</div>')
+    release_time = first_mydramalist_text(
+        card_html, r'release-time calendar-popover-source"[^>]*>\s*([^<]*?)\s*</div>'
+    )
+    show_timezone = first_mydramalist_text(
+        card_html, r'<div class="calendar-popover-title">\s*([^<]*?)\s*</div>'
+    )
+    score = first_mydramalist_text(card_html, r'class="p-l-xs score">\s*([^<]*?)\s*</div>')
+    genres = [
+        genre.strip()
+        for genre in re.findall(r'<div class="genre">\s*([^<]*?)\s*</div>', card_html)
+        if genre.strip()
+    ]
+
+    show_match = re.search(r'href="/(\d+)-[^"]*"', card_html)
+    show_id = show_match.group(1) if show_match else ""
+    if not show_id:
+        return None
+
+    episode_match = re.search(r'href="/(\d+)-[^"]*/episode/(\d+)"', card_html)
+    episode_number = episode_match.group(2) if episode_match else ""
+    episode_path = episode_match.group(0).split('"')[1] if episode_match else ""
+    show_path = show_match.group(0).split('"')[1] if show_match else ""
+
+    aired_dt, aired_iso = mydramalist_air_time(day_text, release_time, show_timezone)
+    aired_text = f"{day_text} {release_time}".strip()
+    if aired_dt is not None:
+        if MYDRAMALIST_ONLY_AIRED and aired_dt > allowed_until:
+            return None
+        aired_text = f"{aired_iso} ({show_timezone})"
+
+    kind = "episode" if episode_number else "movie"
+    key = f"mydramalist:{show_id}:ep{episode_number}" if episode_number else f"mydramalist:{show_id}:movie"
+
+    subtitle_parts = list(genres)
+    if score:
+        subtitle_parts.append(f"评分 {score}")
+
+    source_parts = ["MyDramaList"]
+    if content_type:
+        source_parts.append(content_type)
+    if show_timezone:
+        source_parts.append(show_timezone)
+
+    page_path = episode_path or show_path
+    return {
+        "key": key,
+        "type": kind,
+        "label": mydramalist_label(content_type),
+        "title": title,
+        "subtitle": " · ".join(subtitle_parts),
+        "code": f"E{episode_number}" if episode_number else "Movie",
+        "aired": aired_text or f"{day_text} {release_time}".strip(),
+        "time_label": "播出时间",
+        "source": " · ".join(source_parts),
+        "url": f"https://mydramalist.com{page_path}" if page_path else "",
+        "country": content_type,
+    }
+
+
+def first_mydramalist_text(card_html: str, pattern: str) -> str:
+    match = re.search(pattern, card_html)
+    if not match:
+        return ""
+    return html.unescape(match.group(1)).strip()
+
+
+def mydramalist_zone(name: str):
+    try:
+        return ZoneInfo(name)
+    except Exception:
+        return timezone.utc
+
+
+def mydramalist_air_time(
+    day_text: str,
+    release_time: str,
+    show_timezone: str,
+) -> Tuple[Optional[datetime], str]:
+    """把「日期 + 当地播出时间 + 时区」换算成 UTC 时间。"""
+    try:
+        day = datetime.strptime(day_text.strip(), "%B %d, %Y").date()
+    except ValueError:
+        return None, ""
+
+    match = re.match(r"(\d{1,2}):(\d{2})\s*([AaPp][Mm])", release_time.strip())
+    if not match:
+        # 电影等条目只有日期没有时间，按当天 00:00 处理。
+        local_day = datetime(day.year, day.month, day.day, tzinfo=mydramalist_zone(show_timezone))
+        return local_day.astimezone(timezone.utc), f"{day.year:04d}-{day.month:02d}-{day.day:02d} 全天"
+
+    hour = int(match.group(1)) % 12
+    if match.group(3).upper() == "PM":
+        hour += 12
+    minute = int(match.group(2))
+
+    local = datetime(day.year, day.month, day.day, hour, minute, tzinfo=mydramalist_zone(show_timezone))
+    return local.astimezone(timezone.utc), f"{day.year:04d}-{day.month:02d}-{day.day:02d} {hour:02d}:{minute:02d}"
+
+MYDRAMALIST_COUNTRY_LABELS = {
+    "Korean": "韩",
+    "Japanese": "日",
+    "Chinese": "国产",
+    "Hong Kong": "港",
+    "Taiwanese": "台",
+    "Thai": "泰",
+    "Filipino": "菲",
+    "Philippine": "菲",
+    "Singaporean": "新加坡",
+}
+
+MYDRAMALIST_KIND_LABELS = {
+    "Drama": "剧",
+    "Movie": "电影",
+    "TV Show": "综艺",
+    "Special": "特辑",
+}
+
+MYDRAMALIST_LABEL_OVERRIDES = {
+    ("Korean", "Movie"): "韩影",
+    ("Japanese", "Movie"): "日影",
+    ("Hong Kong", "Movie"): "港片",
+    ("Taiwanese", "Movie"): "台片",
+    ("Thai", "Movie"): "泰影",
+    ("Korean", "TV Show"): "韩综",
+    ("Japanese", "TV Show"): "日综",
+    ("Hong Kong", "TV Show"): "港综",
+    ("Taiwanese", "TV Show"): "台综",
+    ("Thai", "TV Show"): "泰综",
+    ("Chinese", "TV Show"): "国产综艺",
+}
+
+
+def mydramalist_label(content_type: str) -> str:
+    text = content_type.strip()
+    if not text:
+        return "MDL 剧集"
+
+    match = re.match(r"^(.+?)\s+(Drama|Movie|TV Show|Special)$", text)
+    if not match:
+        return f"MDL {text}"
+
+    raw_country = match.group(1)
+    raw_kind = match.group(2)
+    override = MYDRAMALIST_LABEL_OVERRIDES.get((raw_country, raw_kind))
+    if override:
+        return f"MDL {override}"
+
+    country = MYDRAMALIST_COUNTRY_LABELS.get(raw_country, raw_country)
+    kind = MYDRAMALIST_KIND_LABELS.get(raw_kind, raw_kind)
+    return f"MDL {country}{kind}"
 
 
 def ffzy_site_config() -> ResourceSiteConfig:
@@ -1903,6 +2171,12 @@ def main() -> int:
         justwatch_items = fetch_justwatch_items()
         ffzy_items = fetch_ffzy_items()
         bfzy_items = fetch_bfzy_items()
+        try:
+            mydramalist_items = fetch_mydramalist_items()
+        except Exception as exc:
+            # MyDramaList 可能触发风控，失败时只跳过这个源，不影响其他渠道。
+            logging.error("MyDramaList 获取失败，本次跳过：%s", exc)
+            mydramalist_items = []
 
         baseline_ids: List[str] = []
         if justwatch_items and JUSTWATCH_BOOTSTRAP_ONLY and not any(
@@ -1924,6 +2198,20 @@ def main() -> int:
             calendar_items.extend(justwatch_items)
 
         baseline_seen = set()
+
+        if mydramalist_items and MYDRAMALIST_BOOTSTRAP_ONLY and not any(
+            item.startswith("mydramalist:") for item in pushed_ids
+        ):
+            baseline_count = add_baseline_items(
+                mydramalist_items, pushed_set, baseline_seen, baseline_ids
+            )
+            logging.info(
+                "MyDramaList 首次运行已建立 %s 条基线记录，本次不推送这些历史条目。",
+                baseline_count,
+            )
+        else:
+            calendar_items.extend(mydramalist_items)
+
         resource_site_batches = [
             (ffzy_site_config(), ffzy_items),
             (bfzy_site_config(), bfzy_items),
