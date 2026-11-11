@@ -1217,8 +1217,13 @@ def extract_mydramalist_item(
         card_html, r'<span class="p-l-xs score">\s*([^<]*?)\s*</span>'
     )
     image = first_mydramalist_text(
-        card_html, r'<img class="img-responsive"[^>]*src="([^"]+)"', re.S
+        card_html, r'<img class="img-responsive[^"]*"[^>]*\ssrc="([^"]+)"', re.S
     )
+    if not image:
+        # 页面靠后的卡片是懒加载，只有 data-src，没有 src。
+        image = first_mydramalist_text(
+            card_html, r'<img class="img-responsive[^"]*"[^>]*\sdata-src="([^"]+)"', re.S
+        )
     # 列表页给的是 4c 小图，换成 4f 原图，Telegram 卡片更清晰。
     if image.endswith("_4c.jpg"):
         image = image[: -len("_4c.jpg")] + "_4f.jpg"
@@ -1298,15 +1303,23 @@ def first_mydramalist_text(card_html: str, pattern: str, flags: int = 0) -> str:
     return html.unescape(match.group(1)).strip()
 
 
+_ZONE_CACHE: Dict[str, Any] = {}
+
+
 def mydramalist_zone(name: str):
+    cached = _ZONE_CACHE.get(name)
+    if cached is not None:
+        return cached
     try:
-        return ZoneInfo(name)
+        zone = ZoneInfo(name)
     except Exception:
         # 缺 tzdata 时退回 UTC，会把播出时间整体偏移，日志里明确提示。
         logging.warning(
             "时区 %s 不可用（缺少 tzdata？），本次按 UTC 处理播出时间，可能偏移。", name or "UTC"
         )
-        return timezone.utc
+        zone = timezone.utc
+    _ZONE_CACHE[name] = zone
+    return zone
 
 
 def mydramalist_air_time(
