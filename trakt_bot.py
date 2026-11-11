@@ -1260,9 +1260,8 @@ def extract_mydramalist_item(
     airing_text = first_mydramalist_text(
         card_html, r'<div class="airing-at">\s*(.*?)\s*</div>', re.S
     )
-    episode_match = re.search(r"Episode\s+(\d+)(?:\s*[-–]\s*(\d+))?", airing_text, re.I)
+    episode_match = re.search(r"Episode\s+(\d+)", airing_text, re.I)
     episode_number = episode_match.group(1) if episode_match else ""
-    episode_end = (episode_match.group(2) or "") if episode_match else ""
     episode_path = f"{show_path}/episode/{episode_number}" if episode_number else ""
 
     aired_dt, aired_iso = mydramalist_air_time(
@@ -1272,12 +1271,20 @@ def extract_mydramalist_item(
     if aired_dt is not None:
         if MYDRAMALIST_ONLY_AIRED and aired_dt > allowed_until:
             return None
-        aired_text = f"{aired_iso} ({show_timezone})"
+        aired_text = mydramalist_display_time(aired_dt, show_timezone)
 
     kind = "episode" if episode_number else "movie"
-    key = f"mydramalist:{show_id}:ep{episode_number}" if episode_number else f"mydramalist:{show_id}:movie"
-
     air_ts = int(aired_dt.timestamp()) if aired_dt is not None else 0
+    # 集号不能拿来当主键：MyDramaList 对同一次播出会随机返回不同的集号
+    # （同一部剧抓到过 E1/E3/E5/E12，总集数也从 35 跳到 50）。
+    # 播出时刻是稳定的，用它做去重键，同一次播出只推一条。
+    if air_ts:
+        slot = str(air_ts)
+    elif aired_iso:
+        slot = aired_iso.replace(" ", "-").replace(":", "")
+    else:
+        slot = re.sub(r"\W+", "-", day_text).strip("-")
+    key = f"mydramalist:{show_id}:{slot}"
     air_status = ""
     if air_ts:
         air_status = "已开播" if air_ts <= int(now.timestamp()) else "待开播"
@@ -1297,11 +1304,8 @@ def extract_mydramalist_item(
         "label": mydramalist_label(content_type),
         "title": title,
         "subtitle": " · ".join(subtitle_parts),
-        "code": (
-            f"E{episode_number}-{episode_end}"
-            if episode_end.isdigit() and int(episode_end) > int(episode_number)
-            else (f"E{episode_number}" if episode_number else "Movie")
-        ),
+        # 只显示集号，不显示「总集数」：那个数字也在随机变化，展示出来会误导。
+        "code": f"E{episode_number}" if episode_number else "Movie",
         "aired": aired_text or f"{day_text} {release_time}".strip(),
         "time_label": "播出时间",
         "source": " · ".join(source_parts),
@@ -1388,6 +1392,31 @@ def mydramalist_air_time(
 
     local = datetime(day.year, day.month, day.day, hour, minute, tzinfo=zone)
     return local.astimezone(timezone.utc), f"{day.year:04d}-{day.month:02d}-{day.day:02d} {hour:02d}:{minute:02d}"
+
+VIEWER_ZONE_LABELS = {"Asia/Shanghai": "北京时间", "Asia/Seoul": "首尔时间"}
+
+
+def mydramalist_display_time(aired_dt: datetime, show_timezone: str) -> str:
+    """把播出时刻同时写成「观看者时区」和「剧集当地」两种说法。
+
+    页面粗体时间是按访问者时区渲染的，括号里是剧集当地时间，两者其实是同一时刻。
+    只写其中一个，读者很容易按自己的钟去对，误以为差了 1 小时。
+    """
+    try:
+        viewer_zone = ZoneInfo(MYDRAMALIST_TIMEZONE)
+    except Exception:
+        viewer_zone = timezone.utc
+
+    viewer_label = VIEWER_ZONE_LABELS.get(MYDRAMALIST_TIMEZONE, MYDRAMALIST_TIMEZONE)
+    viewer_local = aired_dt.astimezone(viewer_zone)
+    text = f"{viewer_local:%Y-%m-%d %H:%M} {viewer_label}"
+
+    if show_timezone and show_timezone != MYDRAMALIST_TIMEZONE:
+        show_local = aired_dt.astimezone(mydramalist_zone(show_timezone))
+        text += f"（当地 {show_local:%m-%d %H:%M} · {show_timezone}）"
+
+    return text
+
 
 MYDRAMALIST_COUNTRY_LABELS = {
     "Korean": "韩",
