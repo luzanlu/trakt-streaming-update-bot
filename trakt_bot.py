@@ -1290,7 +1290,7 @@ def extract_mydramalist_item(
         "subtitle": " · ".join(subtitle_parts),
         "code": (
             f"E{episode_number}-{episode_end}"
-            if episode_end
+            if episode_end.isdigit() and int(episode_end) > int(episode_number)
             else (f"E{episode_number}" if episode_number else "Movie")
         ),
         "aired": aired_text or f"{day_text} {release_time}".strip(),
