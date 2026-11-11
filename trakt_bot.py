@@ -424,7 +424,16 @@ MYDRAMALIST_REMIND_WINDOW_MINUTES = max(
 MYDRAMALIST_ALERT_KEY_PREFIX = "mydramalist-alert:"
 # 首次启用这个源时，只把最近几天到点的条目推出来，更远的先记账，避免一次刷几十条。
 MYDRAMALIST_INITIAL_PUSH_DAYS = max(0, config_int("mydramalist", "initial_push_days", "MYDRAMALIST_INITIAL_PUSH_DAYS", 3))
-MYDRAMALIST_INITIAL_MARKER = "mydramalist-initial-v2"
+# 键里必须带冒号：load_pushed_ids 会把没有冒号的旧键改写成 episode:xxx，
+# 原来的 mydramalist-initial-v2 因此读回来就失配，导致每轮都被当成首次运行。
+MYDRAMALIST_INITIAL_MARKER = "mydramalist:initial:v2"
+
+
+def mydramalist_initial_done(keys: Sequence[str]) -> bool:
+    """标记是否已经写过；兼容旧版本存下的 episode:mydramalist-initial-v2。"""
+    return any(
+        key == MYDRAMALIST_INITIAL_MARKER or key.endswith("mydramalist-initial-v2") for key in keys
+    )
 MYDRAMALIST_REQUEST_TIMEOUT = max(1, config_int("mydramalist", "request_timeout", "MYDRAMALIST_REQUEST_TIMEOUT", 20))
 MYDRAMALIST_USER_AGENT = os.getenv(
     "MYDRAMALIST_USER_AGENT",
@@ -2524,7 +2533,7 @@ def main(only_source: str = "") -> int:
         elif (
             mydramalist_items
             and MYDRAMALIST_INITIAL_PUSH_DAYS > 0
-            and MYDRAMALIST_INITIAL_MARKER not in pushed_set
+            and not mydramalist_initial_done(pushed_set)
         ):
             # 新模式的第一次运行：只推最近几天到点的，剩下的先记账不推，避免一次刷几十条。
             horizon = int(
@@ -2542,7 +2551,7 @@ def main(only_source: str = "") -> int:
                     pushed_set.add(item["key"])
                     deferred += 1
 
-            if MYDRAMALIST_INITIAL_MARKER not in pushed_set:
+            if not mydramalist_initial_done(baseline_ids):
                 baseline_ids.append(MYDRAMALIST_INITIAL_MARKER)
                 pushed_set.add(MYDRAMALIST_INITIAL_MARKER)
 
