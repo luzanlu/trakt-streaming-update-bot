@@ -1244,10 +1244,17 @@ def extract_mydramalist_item(
     if not show_id:
         return None
 
-    episode_match = re.search(r'href="/(\d+)-[^"]*/episode/(\d+)"', card_html)
-    episode_number = episode_match.group(2) if episode_match else ""
-    episode_path = episode_match.group(0).split('"')[1] if episode_match else ""
     show_path = show_match.group(0).split('"')[1] if show_match else ""
+
+    # 卡片自己的 airing-at 才是当前这一格播的集数；弹层里那串 episode 链接是全剧列表，
+    # 顺序不固定，取第一个会取到别的集。
+    airing_text = first_mydramalist_text(
+        card_html, r'<div class="airing-at">\s*(.*?)\s*</div>', re.S
+    )
+    episode_match = re.search(r"Episode\s+(\d+)(?:\s*[-–]\s*(\d+))?", airing_text, re.I)
+    episode_number = episode_match.group(1) if episode_match else ""
+    episode_end = (episode_match.group(2) or "") if episode_match else ""
+    episode_path = f"{show_path}/episode/{episode_number}" if episode_number else ""
 
     aired_dt, aired_iso = mydramalist_air_time(
         day_text, popover_time, release_time, show_timezone
@@ -1281,7 +1288,11 @@ def extract_mydramalist_item(
         "label": mydramalist_label(content_type),
         "title": title,
         "subtitle": " · ".join(subtitle_parts),
-        "code": f"E{episode_number}" if episode_number else "Movie",
+        "code": (
+            f"E{episode_number}-{episode_end}"
+            if episode_end
+            else (f"E{episode_number}" if episode_number else "Movie")
+        ),
         "aired": aired_text or f"{day_text} {release_time}".strip(),
         "time_label": "播出时间",
         "source": " · ".join(source_parts),
